@@ -21,6 +21,22 @@ In the recognition folder, you will find many recognition problems solved includ
 * transformers
   etc.
 
+# HIPMRI Study for prostate cancer radiotherapy
+
+### Notes for me:
+
+* Rangpur Path: /home/groups/comp3710/HipMRI_Study_open
+  2D Data:/home/groups/comp3710/HipMRI_Study_open/keras_slices_data
+* The body outline, bone, bladder, rectum, and prostate regions
+  are segmented in 3D by an MR physicist with more than 10 years of experience.
+
+
 ## Samantha's Log
 
 I started late but I believe in myself.
+
+To Do
+
+* [ ] Choose a module to do stuff on
+* [ ] Download Dataset locally to stuff around, put it into gitignore
+* [ ] begin hopefully
