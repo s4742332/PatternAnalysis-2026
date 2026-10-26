@@ -12,10 +12,8 @@ Data Notes:
 3. Data must be of same size, and greyscale
 
 JOBS:
-1. Load scans from one folder 
-2. Parse file names correctly
-3. Patients and scans correctly connected in 1 folder
-4. splits between folders
+1. Load and split all folders
+2. Check if images pair up correctly between the segmented folders and the image folders
 """
 import os
 import sys
@@ -26,9 +24,11 @@ from collections import Counter
 
 DATA_ROOT = Path(r"S:\PatternAnalysis-2026\HipMRI_Study_Open\keras_slices_data")
 _NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii\.gz")
+SPLITS = ("train", "validate", "test")
+SPLITS = ("train", "validate", "test")
 
 # dataclasses
-@dataclass
+@dataclass(frozen=True)
 class SliceID:
     """one slice: patient case, weekly scan, axial slice index."""
     case: str
@@ -66,27 +66,33 @@ def summarise_folder(folder: Path):
     
     return patients, scans
 
+def ids_in(folder: Path) -> set[SliceID]:
+    return {parse_name(f.name) for f in folder.iterdir()}
+
+def check_pairs(root: Path, split: str) -> None:
+    images = ids_in(root / f"keras_slices_{split}")
+    masks  = ids_in(root / f"keras_slices_seg_{split}")
+    only_images = images - masks     # set difference
+    only_masks  = masks - images
+    assert not only_images and not only_masks, (
+        f"{split}: {len(only_images)} images without masks, "
+        f"{len(only_masks)} masks without images"
+    )
+    print(f"{split}: {len(images)} images/masks paired OK")
+
+
+
+def patients_by_split(root: Path) -> dict[str, set[int]]:
+    result = {}
+    for split in SPLITS:
+        patients, scans = summarise_folder(root / f"keras_slices_{split}")
+        print(f"{split:9} patients={len(patients):3}  scans={len(scans):4}")
+        result[split] = patients, scans    # TODO: what goes in the dict?
+    return result
+
+
 if __name__ == "__main__":
     print("Get jobs 1-4 working")
-    files = list_folder( DATA_ROOT / "keras_slices_train")
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_train")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_seg_train")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_validate")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_seg_validate")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_seg_test")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    patients, scans = summarise_folder(DATA_ROOT/ "keras_slices_test")
-    print(len(patients), len(scans))
-    print(sorted(scans))
-    print(len(files))
-    for f in files[:5]:
-        print(parse_name(f.name))
+    results = patients_by_split( DATA_ROOT)
+    for split in SPLITS:
+        check_pairs(DATA_ROOT, split)
