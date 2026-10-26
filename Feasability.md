@@ -1,4 +1,4 @@
-# Required Feasibility 
+# Required Feasibility
 
 This feasibility assessment is for section 2D U-Net for the HipMRI 2D Slices annotation assistant.
 
@@ -30,3 +30,9 @@ no implementations as of now
 ### Risks, Budget and Fallback
 
 As the user need is for speed of information to help, it should be
+
+
+
+Risks include but are not limited to:
+
+- Missing, corrupted, and non-uniform case data of a patient over the course of the 60 weeks. This has been identified as keras_slices_train missing patient 034. Inequal case lengths between patients (1 week vs 8 weeks for 1 patient case for example).
