@@ -12,8 +12,7 @@ Data Notes:
 3. Data must be of same size, and greyscale
 
 JOBS:
-1. Load and split all folders
-2. Check if images pair up correctly between the segmented folders and the image folders
+1. Determine which patients appear in other splits, we don't want to be using seen training data for testing/validation
 """
 import os
 import sys
@@ -21,6 +20,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import re
 from collections import Counter 
+from itertools import combinations
 
 DATA_ROOT = Path(r"S:\PatternAnalysis-2026\HipMRI_Study_Open\keras_slices_data")
 _NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii\.gz")
@@ -36,6 +36,7 @@ class SliceID:
     slice: int
 
 # folder work
+
 def parse_name(name: str) -> SliceID:
     m = _NAME_RE.fullmatch(name)
     if m is None:
@@ -81,14 +82,23 @@ def check_pairs(root: Path, split: str) -> None:
     print(f"{split}: {len(images)} images/masks paired OK")
 
 
-
-def patients_by_split(root: Path) -> dict[str, set[int]]:
+def patients_by_split(root: Path) -> dict[str, set[str]]:
     result = {}
     for split in SPLITS:
         patients, scans = summarise_folder(root / f"keras_slices_{split}")
         print(f"{split:9} patients={len(patients):3}  scans={len(scans):4}")
-        result[split] = patients, scans    # TODO: what goes in the dict?
+        result[split] = patients    # TODO: what goes in the dict?
     return result
+
+def check_no_patient_leakages(patients: dict[str, set[str]]):
+    problems = []
+    for a, b in combinations(patients, 2):
+        shared = patients[a] & patients[b]          # patients in both splits
+        if shared:
+            problems.append(f"{a} & {b} share {sorted(shared)}")
+    if problems:
+        raise ValueError("patient leakage: " + "; ".join(problems))
+    print("no leakage")
 
 
 if __name__ == "__main__":
@@ -96,3 +106,10 @@ if __name__ == "__main__":
     results = patients_by_split( DATA_ROOT)
     for split in SPLITS:
         check_pairs(DATA_ROOT, split)
+        results = patients_by_split( DATA_ROOT )
+        check_no_patient_leakages(results)
+    
+    good = {"train": {"004", "005"}, "validate": {"036"}, "test": {"040"}}
+    bad  = {"train": {"004", "040"}, "validate": {"036"}, "test": {"040"}}
+    check_no_patient_leakages(good)   # prints: no leakage
+    check_no_patient_leakages(bad)    # crashes: ValueError: patient leakage: train & test share ['040']
