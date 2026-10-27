@@ -19,6 +19,7 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 from typing import Optional
 
+from torch import tensor
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
@@ -26,6 +27,8 @@ from torchvision.transforms import functional as F
 DATA_ROOT = Path(r"S:\PatternAnalysis-2026\HipMRI_Study_Open\keras_slices_data")
 _NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii\.gz")
 SPLITS = ("train", "validate", "test")
+H, W = 256, 128 # most slices; 019_week_1 is 256x144 and gets cropped
+N_LABELS = 6
 
 
 # dataclasses
@@ -107,6 +110,27 @@ def parse_to_sliceid(name: str, img_path: Path, mask_path: Path) -> SliceID:
         mask_path=mask_path
     )
 
+# loading
+def center_crop(a: np.ndarray, h: int = H, w: int = W):
+    if a.shape[0] < h or a.shape[1] < w:
+        raise ValueError(f"can't crop {a.shape} to {(h, w)}")
+    top = (a.shape[0] - h) // 2
+    left = (a.shape[1] - w) // 2
+    return a[top:top + h, left:left + w]
+
+def load_slice(sid: SliceID):
+    image = nib.load(sid.image_path).get_fdata().astype(np.float32)
+    mask = np.asarray(nib.load(sid.mask_path).dataobj)
+    if image.shape != mask.shape:
+        raise ValueError(f"{sid}: image {image.shape} vs mask {mask.shape}")
+    if image.shape != (H, W):
+        image, mask = center_crop(image), center_crop(mask) # same crop for both
+
+    image = (image - image.mean()) / (image.std() + 1e-8) # per-slice z-score, eps for blank slices
+    if mask.min() < 0 or mask.max() >= N_LABELS:
+        raise ValueError(f"{sid}: labels {np.unique(mask)} outside 0-{N_LABELS - 1}")
+    return image, mask.astype(np.uint8)
+
 def file_names_in(folder: Path):
     return {f.name for f in folder.iterdir()}
 
@@ -143,6 +167,9 @@ def check_no_patient_leakages(patients: dict[str, set[int]]):
 
 def check_slice_count(slices_per_scan):
     return {scan: n for scan, n in slices_per_scan.items() if n!= 60}
+
+def check_img_shape(image_metadata):
+    return image_metadata.shape
 
 def check_labels(root:Path):
     shapes, dtypes, zooms, labels = Counter(), Counter(), Counter(), Counter()
@@ -183,6 +210,28 @@ def check_weeks_per_case(split: str, ids: list[SliceID]):
         print(f"{split} patient {patient:03d}: {len(weeks)} weeks {sorted(weeks)}")
     return weeks_per_case
 
+### REFER TO https://github.com/cosmic-cortex/pytorch-UNet/blob/master/unet/dataset.py
+def to_long_tensor(pic):
+    # handle numpy array
+    img = torch.from_numpy(np.array(pic, np.uint8))
+    # backward compatibility
+    return img.long()
+
+
+def correct_dims(*images):
+    corr_images = []
+    for img in images:
+        if len(img.shape) == 2:
+            corr_images.append(np.expand_dims(img, axis=2))
+        else:
+            corr_images.append(img)
+
+    if len(corr_images) == 1:
+        return corr_images[0]
+    else:
+        return corr_images
+
+###
 
 class HipMRISlices(Dataset):
     """
@@ -203,3 +252,12 @@ if __name__ == "__main__":
         #_ = check_weeks_per_case(split, ids)
         #check_labels(DATA_ROOT / f"keras_slices_seg_{split}")
     #check_images_manually(all_ids["train"][45])
+
+    # load_slice check: one normal slice and one from 019_week_1 (256x144, gets cropped)
+    pooled = [s for ids in all_ids.values() for s in ids]
+    cropped = next(s for s in pooled if s.patient == 19 and s.week == 1)
+    for sid in (pooled[0], cropped):
+        image, mask = load_slice(sid)
+        print(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}: "
+              f"image {image.shape} {image.dtype} mean={image.mean():.3f} std={image.std():.3f}  "
+              f"mask {mask.shape} {mask.dtype} labels={np.unique(mask)}")
