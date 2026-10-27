@@ -5,88 +5,104 @@ free train/validation/test splitting functions and data augmentations
 
 """
 Data Notes:
-1. 
+1.
 """
 import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass
 import re
-from collections import Counter 
+from collections import Counter
 from itertools import combinations
 import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
 
+from torch.utils.data import Dataset
+from torchvision import transforms as T
+from torchvision.transforms import functional as F
+
 DATA_ROOT = Path(r"S:\PatternAnalysis-2026\HipMRI_Study_Open\keras_slices_data")
 _NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii\.gz")
 SPLITS = ("train", "validate", "test")
-SPLITS = ("train", "validate", "test")
+
 
 # dataclasses
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class SliceID:
-    """one slice: patient case, weekly scan, axial slice index."""
-    case: str
+    """one slice: patient case, weekly scan, axial slice index and the paths to both it's image and mask paths
+    not a seperated ID as mask-images must always be paired
+    """
+    patient: int # parsed as int so 004 and 4 are the same patient
     week: int
     slice: int
+    image_path: Path
+    mask_path: Path
 
 # folder work
+def name_to_paths(root: Path, split: str, name: str):
+    """image file name -> (image path, mask path). mask name is the image name with case_ swapped for seg_"""
+    mask_name = "seg_" + name.removeprefix("case_")
+    return root / f"keras_slices_{split}" / name, root / f"keras_slices_seg_{split}" / mask_name
 
-def parse_name(name: str) -> SliceID:
+def build_sliceids(root: Path, split: str):
+    check_pairs(root=root, split=split)
+    all_ids = []
+    for name in file_names_in(root / f"keras_slices_{split}"):
+        img_path, mask_path = name_to_paths(root, split, name)
+        all_ids.append(parse_to_sliceid(name, img_path=img_path, mask_path=mask_path))
+    return sorted(all_ids) # file_names_in is a set, so sort by patient, week, slice
+
+def build_all_sliceids(root: Path):
+    all_slice_ids = {split: build_sliceids(root, split) for split in SPLITS}
+    check_no_patient_leakages({split: patients_in(ids) for split, ids in all_slice_ids.items()})
+    for split, ids in all_slice_ids.items():
+        bad = check_slice_count(Counter((s.patient, s.week) for s in ids))
+        if bad:
+            raise ValueError(f"{split}: scans without 60 slices: {bad}")
+    return all_slice_ids
+
+def parse_file_name(name: str):
     m = _NAME_RE.fullmatch(name)
     if m is None:
         raise ValueError(f"bad filename: {name}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)) #patient, week, slice
+
+def parse_to_sliceid(name: str, img_path: Path, mask_path: Path) -> SliceID:
+    patient, week, slice_idx = parse_file_name(name=name)
     return SliceID(
-        case=f"{int(m.group(1)):03d}",
-        week=int(m.group(2)),    
-        slice=int(m.group(3)),    
+        patient=patient,
+        week=week,
+        slice=slice_idx,
+        image_path=img_path,
+        mask_path=mask_path
     )
 
-def list_folder(folder: Path) -> list[Path]:
-    return sorted(folder.iterdir())
+def file_names_in(folder: Path):
+    return {f.name for f in folder.iterdir()}
 
-def summarise_folder(folder: Path):
-    patients = set()
-    scans = set()
-    slices_per_scan = Counter()
+def patients_in(ids: list[SliceID]):
+    return {s.patient for s in ids}
 
-    for f in folder.iterdir():
-        sid = parse_name(f.name)
-        patients.add(sid.case)
-        scans.add((sid.case, sid.week)) # a scan = week + case
-        slices_per_scan[(sid.case, sid.week)] += 1
-
-    # every scan should have 60 slices 
-    bad = check_slice_count(slices_per_scan)
-    assert not bad, f"scans without 60 slices: {bad}"
-    
-    return patients, scans
-
-def ids_in(folder: Path) -> set[SliceID]:
-    return {parse_name(f.name) for f in folder.iterdir()}
-
-def patients_by_split(root: Path):
-    result = {}
-    for split in SPLITS:
-        patients, scans = summarise_folder(root / f"keras_slices_{split}")
-        print(f"{split:9} patients={len(patients):3}  scans={len(scans):4}")
-        result[split] = patients    # TODO: what goes in the dict?
-    return result
+def summarise_split(split: str, ids: list[SliceID]):
+    scans = {(s.patient, s.week) for s in ids} # a scan = patient + week
+    print(f"{split:9} patients={len(patients_in(ids)):3}  scans={len(scans):4}  slices={len(ids):5}")
 
 # data checks/investigation -> class soon?
-def check_pairs(root: Path, split: str) -> None:
-    images = ids_in(root / f"keras_slices_{split}")
-    masks  = ids_in(root / f"keras_slices_seg_{split}")
+def check_pairs(root: Path, split: str):
+    # compare parsed (patient, week, slice) tuples, the names themselves differ (case_ vs seg_)
+    images = {parse_file_name(n) for n in file_names_in(root / f"keras_slices_{split}")}
+    masks  = {parse_file_name(n) for n in file_names_in(root / f"keras_slices_seg_{split}")}
     only_images = images - masks     # set difference
     only_masks  = masks - images
-    assert not only_images and not only_masks, (
-        f"{split}: {len(only_images)} images without masks, "
-        f"{len(only_masks)} masks without images"
-    )
+    if only_images or only_masks:
+        raise ValueError(
+            f"{split}: {len(only_images)} images without masks, "
+            f"{len(only_masks)} masks without images"
+        )
     print(f"{split}: {len(images)} images/masks paired OK")
 
-def check_no_patient_leakages(patients: dict[str, set[str]]):
+def check_no_patient_leakages(patients: dict[str, set[int]]):
     problems = []
     for a, b in combinations(patients, 2):
         shared = patients[a] & patients[b]          # patients in both splits
@@ -115,10 +131,9 @@ def check_labels(root:Path):
         print("   labels:", {k: f"{v/tot:.4%}" for k, v in sorted(labels.items())})
     return
 
-def check_images_manually(root:Path, split: str, sid: SliceID):
-    img_path, seg_path = sliceId_to_dir(root=root, split=split, sid=sid)
-    image = nib.load(img_path).get_fdata()
-    mask = np.asarray(nib.load(seg_path).dataobj)
+def check_images_manually(sid: SliceID):
+    image = nib.load(sid.image_path).get_fdata()
+    mask = np.asarray(nib.load(sid.mask_path).dataobj)
     labels = np.unique(mask)
     fig, axes = plt.subplots(1, len(labels), figsize=(3 * len(labels), 5))
     for ax, k in zip(axes, labels):
@@ -126,30 +141,32 @@ def check_images_manually(root:Path, split: str, sid: SliceID):
         ax.imshow(np.ma.masked_where(mask != k, mask).T, alpha=0.5, cmap="autumn")
         ax.set_title(f"label {k}  ({(mask == k).mean():.2%})")
         ax.axis("off")
-    fig.suptitle(f"case {sid.case} week {sid.week} slice {sid.slice}")
+    fig.suptitle(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}")
     plt.show()
 
-def check_weeks_per_case(root:Path, split:str):
-    images = ids_in(root / f"keras_slices_{split}")
+def check_weeks_per_case(split: str, ids: list[SliceID]):
     weeks_per_case = {}
-    for i in images:
-        weeks_per_case.setdefault(i.case, set())
-        weeks_per_case[i.case].add(i.week)
+    for s in ids:
+        weeks_per_case.setdefault(s.patient, set())
+        weeks_per_case[s.patient].add(s.week)
 
-    for case, weeks in sorted(weeks_per_case.items() ):
-        print(f"{split} case {case}: {len(weeks)} weeks {sorted(weeks)}")
+    for patient, weeks in sorted(weeks_per_case.items() ):
+        print(f"{split} patient {patient:03d}: {len(weeks)} weeks {sorted(weeks)}")
     return weeks_per_case
 
 
 class HipMRISlices(Dataset):
-
+    """
+    2D slices
+    """
+    def __init__(self):
+        return
 
 if __name__ == "__main__":
-    results = patients_by_split( DATA_ROOT)
-    #check_images_manually(DATA_ROOT, "train", SliceID(case="004", week=0, slice=45))
-    for split in SPLITS:
-        #check_pairs(DATA_ROOT, split)
-        #check_no_patient_leakages(results)
+    all_ids = build_all_sliceids(DATA_ROOT)
+    for split, ids in all_ids.items():
+        summarise_split(split, ids)
+        print("   first:", ids[:3])
+        #_ = check_weeks_per_case(split, ids)
         #check_labels(DATA_ROOT / f"keras_slices_seg_{split}")
-        _ = check_weeks_per_case(DATA_ROOT, split)
-        #check_images_manually(DATA_ROOT, f"keras_slices_seg_{split}", SliceID(case="004", week=0, slice=30))
+    #check_images_manually(all_ids["train"][45])
