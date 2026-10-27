@@ -14,9 +14,10 @@ from dataclasses import dataclass
 import re
 from collections import Counter
 from itertools import combinations
-import numpy as np
+import numpy as np, random
 import nibabel as nib
 import matplotlib.pyplot as plt
+from typing import Optional
 
 from torch.utils.data import Dataset
 from torchvision import transforms as T
@@ -44,6 +45,34 @@ def name_to_paths(root: Path, split: str, name: str):
     """image file name -> (image path, mask path). mask name is the image name with case_ swapped for seg_"""
     mask_name = "seg_" + name.removeprefix("case_")
     return root / f"keras_slices_{split}" / name, root / f"keras_slices_seg_{split}" / mask_name
+
+def resplit_patients(all_slice_ids: dict[str, list[SliceID]], seed: int | None = None,
+                     n_val: int = 4, n_test: int = 3):
+    if seed is None:
+        return all_slice_ids                        # default: keep the provided split
+
+    pooled = [s for ids in all_slice_ids.values() for s in ids]
+    patients = sorted(patients_in(pooled))          # fixed start order -> same seed, same split
+    if n_val + n_test >= len(patients):
+        raise ValueError(f"n_val + n_test must be < {len(patients)} patients")
+
+    patients = np.random.default_rng(seed).permutation(patients)
+    test_p  = patients[:n_test]
+    val_p   = patients[n_test:n_test + n_val]
+    train_p = patients[n_test + n_val:]
+
+    split_of = {}
+    for p in train_p: split_of[int(p)] = "train"
+    for p in val_p:   split_of[int(p)] = "validate"
+    for p in test_p:  split_of[int(p)] = "test"
+
+    new = {split: [] for split in SPLITS}
+    for s in pooled:
+        new[split_of[s.patient]].append(s)
+    new = {split: sorted(ids) for split, ids in new.items()}
+
+    check_no_patient_leakages({split: patients_in(ids) for split, ids in new.items()})
+    return new
 
 def build_sliceids(root: Path, split: str):
     check_pairs(root=root, split=split)
@@ -164,9 +193,13 @@ class HipMRISlices(Dataset):
 
 if __name__ == "__main__":
     all_ids = build_all_sliceids(DATA_ROOT)
+    all_ids = resplit_patients(all_ids, 1, 5, 5)
+    
     for split, ids in all_ids.items():
         summarise_split(split, ids)
         print("   first:", ids[:3])
+    
+    
         #_ = check_weeks_per_case(split, ids)
         #check_labels(DATA_ROOT / f"keras_slices_seg_{split}")
     #check_images_manually(all_ids["train"][45])
