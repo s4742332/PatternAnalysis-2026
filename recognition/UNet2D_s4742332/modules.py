@@ -170,9 +170,9 @@ class Last2D(nn.Module):
             nn.BatchNorm2d(middle_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(middle_channels, out_channels, kernel_size=1),
-            if softmax == True:
-                layers.append(nn.Softmax(dim=1))
         ]
+        if softmax == True:
+                        layers.append(nn.Softmax(dim=1))
 
         self.first = nn.Sequential(*layers)
 
