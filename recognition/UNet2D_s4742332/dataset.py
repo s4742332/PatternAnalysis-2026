@@ -302,6 +302,66 @@ class HipMRISlices(Dataset):
             image, mask = self.joint_transform(image, mask)
         return image, mask, slice_name(self.ids[idx])
 
+
+#Original Base form by Tivadar Danka: https://github.com/cosmic-cortex/pytorch-UNet/blob/master/unet/unet.py
+class JointTransform2D:
+    """
+    Performs augmentation on image and mask when called. Due to the randomness of augmentation transforms,
+    it is not enough to simply apply the same Transform from torchvision on the image and mask separetely.
+    Doing this will result in messing up the ground truth mask. To circumvent this problem, this class can
+    be used, which will take care of the problems above.
+
+    Changed for HipMRI: works on the tensors HipMRISlices gives (image [1,H,W] z-scored float, mask [H,W] long)
+    instead of PIL, which would clip the z-scored values to 0-255. randomness from torch so workers/seeds behave.
+
+    Args:
+        crop: tuple describing the size of the random crop. If bool(crop) evaluates to False, no crop will
+            be taken. must fit in (H, W), off by default so every batch stays 256x128.
+        p_flip: float, the probability of performing a random horizontal flip.
+        intensity_params: (contrast, brightness), image * U(1-c, 1+c) + U(-b, b) in z-score units.
+            replaces ColorJitter, which assumes [0,1] images and has no use for saturation/hue on grayscale.
+            If bool(intensity_params) evaluates to false, no intensity transformation will be used.
+        p_random_affine: float, the probability of performing a random affine transform.
+        affine_params: (degrees, translate, scale) ranges for T.RandomAffine.get_params. small by default,
+            the reference's 180 deg / 45 deg shear isn't realistic for aligned pelvic slices.
+    """
+    def __init__(self, crop=None, p_flip=0.5, intensity_params=(0.1, 0.1),
+                 p_random_affine=0.5, affine_params=(10, (0.05, 0.05), (0.9, 1.1))):
+        if crop and (crop[0] > H or crop[1] > W):
+            raise ValueError(f"crop {crop} bigger than slices {(H, W)}")
+        self.crop = crop
+        self.p_flip = p_flip
+        self.intensity_params = intensity_params
+        self.p_random_affine = p_random_affine
+        self.affine_params = affine_params
+
+    def __call__(self, image, mask):
+        # random crop
+        if self.crop:
+            i, j, h, w = T.RandomCrop.get_params(image, self.crop)
+            image, mask = F.crop(image, i, j, h, w), F.crop(mask, i, j, h, w)
+
+        if torch.rand(1) < self.p_flip:
+            image, mask = F.hflip(image), F.hflip(mask)
+
+        # intensity transforms || ONLY ON IMAGE
+        if self.intensity_params:
+            c, b = self.intensity_params
+            image = image * float(torch.empty(1).uniform_(1 - c, 1 + c)) + float(torch.empty(1).uniform_(-b, b))
+
+        # random affine transform, nearest for the mask so labels stay 0-5
+        if torch.rand(1) < self.p_random_affine:
+            degrees, translate, scale = self.affine_params
+            size = [image.shape[-1], image.shape[-2]] # get_params wants (w, h)
+            angle, shift, s, shear = T.RandomAffine.get_params((-degrees, degrees), translate, scale, None, size)
+            image = F.affine(image, angle, shift, s, shear,
+                             interpolation=T.InterpolationMode.BILINEAR, fill=[float(image.min())]) # z-scored bg isn't 0
+            mask = F.affine(mask.unsqueeze(0), angle, shift, s, shear,
+                            interpolation=T.InterpolationMode.NEAREST, fill=[0]).squeeze(0) # out of frame = background
+
+        return image, mask
+
+
 if __name__ == "__main__":
     all_ids = build_all_sliceids(DATA_ROOT)
     all_ids = resplit_patients(all_ids, 1, 5, 5)
@@ -333,13 +393,31 @@ if __name__ == "__main__":
     #         raise ValueError(f"cache slice {i} ({pooled[i]}) doesn't match load_slice")
     # print("cache matches load_slice")
 
-    datasets = {split: HipMRISlices(ids, pooled) for split, ids in all_ids.items()}
+    datasets = {split: HipMRISlices(ids, pooled, JointTransform2D() if split == "train" else None)
+                for split, ids in all_ids.items()}
     for split, ds in datasets.items():
         image, mask, name = ds[0]
         print(f"{split:9} len={len(ds):5}  {name}: image {tuple(image.shape)} {image.dtype}  mask {tuple(mask.shape)} {mask.dtype}")
     loader = DataLoader(datasets["train"], batch_size=8, shuffle=True, num_workers=2) # workers: checks the reopen path
     images_b, masks_b, names_b = next(iter(loader))
     print("batch:", tuple(images_b.shape), images_b.dtype, tuple(masks_b.shape), masks_b.dtype, names_b[:2])
+
+    # augmentation check: shapes/dtypes kept, mask labels stay a subset of the original, same seed -> same output
+    plain = HipMRISlices(all_ids["train"], pooled)
+    aug = JointTransform2D()
+    for idx in (0, len(plain) // 2):
+        image, mask, name = plain[idx]
+        torch.manual_seed(0); a_img, a_mask = aug(image, mask)
+        torch.manual_seed(0); b_img, b_mask = aug(image, mask)
+        if a_img.shape != image.shape or a_mask.shape != mask.shape or a_mask.dtype != torch.long:
+            raise ValueError(f"{name}: augmentation changed shape/dtype")
+        if not set(a_mask.unique().tolist()) <= set(mask.unique().tolist()):
+            raise ValueError(f"{name}: augmentation made new labels {a_mask.unique().tolist()}")
+        if not (torch.equal(a_img, b_img) and torch.equal(a_mask, b_mask)):
+            raise ValueError(f"{name}: same seed gave different augmentations")
+        print(f"aug {name}: labels {mask.unique().tolist()} -> {a_mask.unique().tolist()}  "
+              f"fg {(mask > 0).float().mean():.3f} -> {(a_mask > 0).float().mean():.3f}")
+    print("augmentation OK")
 
 
 
