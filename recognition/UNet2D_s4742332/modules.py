@@ -16,10 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class UNet2D(nn.Module):
-    def __init__(self, in_channels, out_channels, conv_depths=(64, 128, 256, 512, 1024)):
+    def __init__(self, in_channels, out_channels, conv_depths=(64, 128, 256, 512, 1024), skip_connected=True):
         assert len(conv_depths) > 2, 'conv_depths must have at least 3 members'
 
         super(UNet2D, self).__init__()
+        self.skip_connected = skip_connected
+        # without skips the decoder only sees the upsampled path, so half the input channels
+        skip = 2 if skip_connected else 1
 
         # defining encoder layers
         encoder_layers = []
@@ -29,9 +32,9 @@ class UNet2D(nn.Module):
 
         # defining decoder layers
         decoder_layers = []
-        decoder_layers.extend([Decoder2D(2 * conv_depths[i + 1], 2 * conv_depths[i], 2 * conv_depths[i], conv_depths[i])
+        decoder_layers.extend([Decoder2D(skip * conv_depths[i + 1], 2 * conv_depths[i], 2 * conv_depths[i], conv_depths[i])
                                for i in reversed(range(len(conv_depths)-2))])
-        decoder_layers.append(Last2D(conv_depths[1], conv_depths[0], out_channels))
+        decoder_layers.append(Last2D(skip * conv_depths[0], conv_depths[0], out_channels))
 
         # encoder, center and decoder layers
         self.encoder_layers = nn.Sequential(*encoder_layers)
@@ -46,11 +49,10 @@ class UNet2D(nn.Module):
         x_dec = [self.center(x_enc[-1])]
         for dec_layer_idx, dec_layer in enumerate(self.decoder_layers):
             x_opposite = x_enc[-1-dec_layer_idx]
-            x_cat = torch.cat(
-                [pad_to_shape(x_dec[-1], x_opposite.shape), x_opposite],
-                dim=1
-            )
-            x_dec.append(dec_layer(x_cat))
+            x_up = pad_to_shape(x_dec[-1], x_opposite.shape)
+            if self.skip_connected:
+                x_up = torch.cat([x_up, x_opposite], dim=1)
+            x_dec.append(dec_layer(x_up))
 
         if not return_all:
             return x_dec[-1]
@@ -168,7 +170,8 @@ class Last2D(nn.Module):
             nn.BatchNorm2d(middle_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(middle_channels, out_channels, kernel_size=1),
-            nn.Softmax(dim=1)
+            if softmax == True:
+                nn.Softmax(dim=1)
         ]
 
         self.first = nn.Sequential(*layers)
