@@ -11,12 +11,22 @@ import json
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # save figures without a window
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from dataset import full_load_dataset, DATA_ROOT, CACHE_DIR, N_LABELS, H, W
 from modules import UNet2D
 from train import LABELS, REGIONS, prostate_regions
+
+LABEL_COLOURS = ListedColormap(["#8da0cb", "#e5c494", "#ffd92f", "#a6d854", "#e41a1c"])  # body .. prostate
+ERROR_COLOURS = {"TP": (1.0, 0.85, 0.0), "FP": (0.85, 0.1, 0.1), "FN": (0.1, 0.45, 0.95)}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a trained 2D U-Net on the HipMRI test split")
@@ -75,6 +85,16 @@ def dice_iou(inter, pred_sum, true_sum, eps=1e-6):
     iou = (inter + eps) / (pred_sum + true_sum - inter + eps)
     return dice.cpu(), iou.cpu()
 
+def connected_components(mask):
+    labels = torch.arange(1, mask[0].numel() + 1, device=mask.device, dtype=torch.float32).view(1, *mask.shape[1:])
+    labels = (labels * mask).unsqueeze(1)
+    keep = mask.unsqueeze(1)
+    while True:
+        spread = F.max_pool2d(labels, kernel_size=3, stride=1, padding=1) * keep
+        if torch.equal(spread, labels):
+            return labels.squeeze(1).long()
+        labels = spread
+
 def sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -91,7 +111,8 @@ def evaluate(model, dataset, device, batch_size):
     model(torch.zeros(batch_size, 1, H, W, device=device))  # warm-up so cuDNN set-up isn't timed in the first case
     sync(device)
 
-    cases = []
+    cases, slices = [], []
+    preds = np.zeros((len(dataset), H, W), dtype=np.uint8)
     for (patient, week), idx in cases_in(dataset).items():
         images, masks, names = zip(*(dataset[k] for k in idx))
         images, masks = torch.stack(images), torch.stack(masks)
@@ -109,19 +130,31 @@ def evaluate(model, dataset, device, batch_size):
         true_sum += t
         r = torch.tensor([regions.get(n, -1) for n in names], device=device)
         keep = r >= 0
-        pred_p = (pred == LABELS["prostate"]).flatten(1)
-        true_p = (masks == LABELS["prostate"]).flatten(1)
-        reg_inter.index_add_(0, r[keep], (pred_p & true_p).sum(1)[keep].float())
-        reg_total.index_add_(0, r[keep], (pred_p.sum(1) + true_p.sum(1))[keep].float())
+        pred_p, true_p = pred == LABELS["prostate"], masks == LABELS["prostate"]
+        s_inter, s_pred, s_true = ((pred_p & true_p).flatten(1).sum(1), pred_p.flatten(1).sum(1), true_p.flatten(1).sum(1))
+        reg_inter.index_add_(0, r[keep], s_inter[keep].float())
+        reg_total.index_add_(0, r[keep], (s_pred + s_true)[keep].float())
         case_dice, _ = dice_iou(i, p, t)
         cases.append({"patient": patient, "week": week, "slices": len(idx), "seconds": seconds,
                       "prostate_dice": case_dice[LABELS["prostate"]].item()})
+
+        # per-slice prostate stats for the failure autopsy, a stray blob is a predicted component not touching the true prostate
+        comps, true_np = connected_components(pred_p).cpu().numpy(), true_p.cpu().numpy()
+        preds[idx] = pred.cpu().numpy()
+        for j, k in enumerate(idx):
+            ids = np.unique(comps[j])
+            ids = ids[ids > 0]
+            stray = np.setdiff1d(ids, comps[j][true_np[j]])
+            slices.append({"index": k, "name": names[j], "patient": patient, "week": week, "slice": dataset.ids[k].slice,
+                           "region": int(r[j]), "inter": int(s_inter[j]), "pred": int(s_pred[j]), "true": int(s_true[j]),
+                           "components": len(ids), "stray_blobs": len(stray),
+                           "stray_px": int(np.isin(comps[j], stray).sum()) if len(stray) else 0})
 
     dice, iou = dice_iou(inter, pred_sum, true_sum)
     region_dice = ((2 * reg_inter + 1e-6) / (reg_total + 1e-6)).cpu()
     peak_vram = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else float("nan")
     return {"dice": dice.tolist(), "iou": iou.tolist(), "region_dice": region_dice.tolist(),
-            "peak_vram_gb": peak_vram, "batch_size": batch_size, "cases": cases}
+            "peak_vram_gb": peak_vram, "batch_size": batch_size, "cases": cases, "slices": slices}, preds
 
 def print_results(name, results):
     seconds = np.array([c["seconds"] for c in results["cases"]])
@@ -146,6 +179,111 @@ def print_comparison(all_results):
               f"{r['region_dice'][0]:6.3f} {r['region_dice'][1]:7.3f} {r['region_dice'][2]:6.3f} "
               f"{case_dice.mean():6.3f}+/-{case_dice.std():.3f} {r['peak_vram_gb']:7.2f} {ms:7.0f}")
 
+def slice_dice(s, eps=1e-6):
+    return (2 * s["inter"] + eps) / (s["pred"] + s["true"] + eps)
+
+def beyond_side(slices):
+    """slice index -> 'base'/'apex' for slices without true prostate: the region of the nearest prostate slice in that scan"""
+    side = {}
+    for case in {(s["patient"], s["week"]) for s in slices}:
+        rows = [s for s in slices if (s["patient"], s["week"]) == case]
+        gland = [s for s in rows if s["region"] >= 0]
+        for s in rows:
+            if s["region"] < 0 and gland:
+                nearest = min(gland, key=lambda g: abs(g["slice"] - s["slice"]))
+                side[s["index"]] = REGIONS[nearest["region"]]
+    return side
+
+def failure_summary(slices):
+    side = beyond_side(slices)
+    gland = [s for s in slices if s["true"] > 0]
+    missed = [s for s in gland if s["pred"] == 0]
+    beyond = [s for s in slices if s["true"] == 0 and s["pred"] > 0]
+    stray = [s for s in gland if s["stray_blobs"] > 0]
+    summary = {
+        "gland_slices": len(gland),
+        "missed": {r: sum(s["region"] == k for s in missed) for k, r in enumerate(REGIONS)},
+        "beyond_gland": {r: sum(side.get(s["index"]) == r for s in beyond) for r in ("base", "apex")},
+        "beyond_gland_median_px": float(np.median([s["pred"] for s in beyond])) if beyond else 0.0,
+        "stray_blob_slices": len(stray),
+        "median_slice_dice": {r: float(np.median([slice_dice(s) for s in gland if s["region"] == k])) for k, r in enumerate(REGIONS)},
+    }
+    print(f"  failure summary: {len(gland)} slices with prostate, {len(missed)} missed entirely "
+          f"({', '.join(f'{r} {n}' for r, n in summary['missed'].items())})")
+    print(f"    {len(beyond)} slices with prostate predicted beyond the gland "
+          f"({', '.join(f'past {r} {n}' for r, n in summary['beyond_gland'].items())}, median {summary['beyond_gland_median_px']:.0f} px)")
+    print(f"    {len(stray)} prostate slices with stray blobs, median slice dice "
+          f"{' '.join(f'{r} {d:.3f}' for r, d in summary['median_slice_dice'].items())}")
+    return summary
+
+def pick_failures(slices):
+    picks, used = [], set()
+    def take(kind, candidates, key):
+        candidates = sorted(candidates, key=key)
+        fresh = [s for s in candidates if (s["patient"], s["week"]) not in used]
+        if fresh or candidates:
+            s = (fresh or candidates)[0]
+            picks.append((kind, s))
+            used.add((s["patient"], s["week"]))
+    worst = lambda s: (slice_dice(s), -s["true"])  # lowest dice, the bigger gland breaks ties
+    take("base", [s for s in slices if s["region"] == 0], worst)
+    take("apex", [s for s in slices if s["region"] == 2], worst)
+    # a visible (10+ px) stray blob next to a gland that was found, otherwise any slice with one
+    stray = [s for s in slices if s["true"] > 0 and s["stray_blobs"] > 0]
+    take("stray blob", [s for s in stray if s["inter"] > 0 and s["stray_px"] >= 10] or stray, lambda s: -s["stray_px"])
+    take("beyond the gland", [s for s in slices if s["true"] == 0 and s["pred"] > 0], lambda s: -s["pred"])
+    return picks
+
+def error_overlay(image, pred, mask):
+    grey = (image - image.min()) / (np.ptp(image) + 1e-8)
+    rgb = np.repeat(grey[..., None], 3, axis=-1)
+    p, t = pred == LABELS["prostate"], mask == LABELS["prostate"]
+    for name, where in (("TP", p & t), ("FP", p & ~t), ("FN", ~p & t)):
+        rgb[where] = 0.35 * rgb[where] + 0.65 * np.array(ERROR_COLOURS[name])
+    return rgb
+
+def zoom_box(pred, mask, margin=12):
+    rows, cols = np.nonzero((pred == LABELS["prostate"]) | (mask == LABELS["prostate"]))
+    if len(rows) == 0:
+        return slice(None), slice(None)
+    return (slice(max(rows.min() - margin, 0), rows.max() + margin + 1),
+            slice(max(cols.min() - margin, 0), cols.max() + margin + 1))
+
+def plot_failure_row(axes, kind, s, image, mask, pred):
+    overlay = error_overlay(image, pred, mask)
+    r, c = zoom_box(pred, mask)
+    panels = [("input", None), ("ground truth", mask), ("prediction", pred), ("prostate errors", "overlay"), ("errors, zoomed", "zoom")]
+    for ax, (title, layer) in zip(axes, panels):
+        if isinstance(layer, str) and layer == "overlay":
+            ax.imshow(overlay.transpose(1, 0, 2))
+        elif isinstance(layer, str) and layer == "zoom":
+            ax.imshow(overlay[r, c].transpose(1, 0, 2))
+        else:
+            ax.imshow(image.T, cmap="gray")
+            if layer is not None:
+                ax.imshow(np.ma.masked_equal(layer, 0).T, cmap=LABEL_COLOURS, vmin=1, vmax=N_LABELS - 1, alpha=0.55, interpolation="nearest")
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
+    axes[0].text(-0.05, 0.5, f"{kind}\n{s['name']}\ndice {slice_dice(s):.2f}\ntrue {s['true']} px, pred {s['pred']} px"
+                 + (f"\n{s['stray_blobs']} stray blob(s), {s['stray_px']} px" if s["stray_blobs"] else ""),
+                 transform=axes[0].transAxes, ha="right", va="center", fontsize=8)
+
+def plot_failures(picks, dataset, preds, out_dir):
+    out_dir.mkdir(exist_ok=True)
+    legend = [Patch(color=ERROR_COLOURS[k]) for k in ERROR_COLOURS]
+    legend += [Patch(color=LABEL_COLOURS(i), alpha=0.55) for i in range(N_LABELS - 1)]
+    labels = ["prostate TP", "prostate FP", "prostate FN"] + [n for n in LABELS if n != "background"]
+    rows = [(kind, s, *(t.squeeze(0).numpy() for t in dataset[s["index"]][:2]), preds[s["index"]]) for kind, s in picks]
+    for name, group in [("failures", rows)] + [(f"failure_{k}_{row[0].replace(' ', '_')}", [row]) for k, row in enumerate(rows, 1)]:
+        fig, axes = plt.subplots(len(group), 5, figsize=(17, 2.6 * len(group) + 0.6), squeeze=False)
+        for ax_row, row in zip(axes, group):
+            plot_failure_row(ax_row, *row)
+        fig.legend(legend, labels, loc="lower center", ncol=len(labels), fontsize=8, frameon=False)
+        fig.tight_layout(rect=(0.08, 0.06, 1, 1))
+        fig.savefig(out_dir / f"{name}.png", dpi=130)
+        plt.close(fig)
+    print(f"  failure figures: {', '.join(f'{kind} {s['name']} (dice {slice_dice(s):.2f})' for kind, s in picks)} -> {out_dir}")
+
 if __name__ == "__main__":
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -161,13 +299,17 @@ if __name__ == "__main__":
         split = (train_args["seed"], train_args["n_val"], train_args["n_test"])
         if split not in datasets:  # runs with the same split share the test set
             datasets[split] = test_dataset(train_args)
-        results = evaluate(model, datasets[split], device, args.batch_size)
+        results, preds = evaluate(model, datasets[split], device, args.batch_size)
         print_results(run_dir.name, results)
+        results["failure_summary"] = failure_summary(results["slices"])
+        picks = pick_failures(results["slices"])
+        plot_failures(picks, datasets[split], preds, run_dir / "failures")
+        results["failures"] = [{"kind": kind, "name": s["name"]} for kind, s in picks]
         with open(run_dir / "test_results.json", "w") as f:
             json.dump(results, f, indent=1)
         all_results[run_dir.name] = results
         del model
         if device.type == "cuda":
-            torch.cuda.empty_cache()  # so the next run's peak VRAM is its own
+            torch.cuda.empty_cache()
     if len(all_results) > 1:
         print_comparison(all_results)
