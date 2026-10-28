@@ -33,6 +33,9 @@ def parse_args():
     p.add_argument("run_dirs", type=Path, nargs="+", help="run folders written by train.py")
     p.add_argument("--checkpoint", default="best.pt", help="checkpoint file inside each run folder")
     p.add_argument("--batch-size", type=int, default=16, help="slices per forward pass at inference")
+    p.add_argument("--fail-dice", type=float, default=0.5, help="prostate slices below this dice are listed as failures")
+    p.add_argument("--slices", nargs="+", metavar="NAME",
+                   help="only draw these test slices (e.g. case_010_week_5_slice_17) into <run>/failures/slices/")
     args = p.parse_args()
     # PowerShell passes wildcards through unexpanded, so expand runs/* here
     run_dirs = []
@@ -268,21 +271,69 @@ def plot_failure_row(axes, kind, s, image, mask, pred):
                  + (f"\n{s['stray_blobs']} stray blob(s), {s['stray_px']} px" if s["stray_blobs"] else ""),
                  transform=axes[0].transAxes, ha="right", va="center", fontsize=8)
 
-def plot_failures(picks, dataset, preds, out_dir):
-    out_dir.mkdir(exist_ok=True)
+def failure_row(kind, s, dataset, preds):
+    image, mask = (t.squeeze(0).numpy() for t in dataset[s["index"]][:2])
+    return kind, s, image, mask, preds[s["index"]]
+
+def save_failure_figure(rows, path):
     legend = [Patch(color=ERROR_COLOURS[k]) for k in ERROR_COLOURS]
     legend += [Patch(color=LABEL_COLOURS(i), alpha=0.55) for i in range(N_LABELS - 1)]
     labels = ["prostate TP", "prostate FP", "prostate FN"] + [n for n in LABELS if n != "background"]
-    rows = [(kind, s, *(t.squeeze(0).numpy() for t in dataset[s["index"]][:2]), preds[s["index"]]) for kind, s in picks]
-    for name, group in [("failures", rows)] + [(f"failure_{k}_{row[0].replace(' ', '_')}", [row]) for k, row in enumerate(rows, 1)]:
-        fig, axes = plt.subplots(len(group), 5, figsize=(17, 2.6 * len(group) + 0.6), squeeze=False)
-        for ax_row, row in zip(axes, group):
-            plot_failure_row(ax_row, *row)
-        fig.legend(legend, labels, loc="lower center", ncol=len(labels), fontsize=8, frameon=False)
-        fig.tight_layout(rect=(0.08, 0.06, 1, 1))
-        fig.savefig(out_dir / f"{name}.png", dpi=130)
-        plt.close(fig)
+    fig, axes = plt.subplots(len(rows), 5, figsize=(17, 2.6 * len(rows) + 0.6), squeeze=False)
+    for ax_row, row in zip(axes, rows):
+        plot_failure_row(ax_row, *row)
+    fig.legend(legend, labels, loc="lower center", ncol=len(labels), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0.08, 0.06, 1, 1))
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+def plot_failures(picks, dataset, preds, out_dir):
+    out_dir.mkdir(exist_ok=True)
+    rows = [failure_row(kind, s, dataset, preds) for kind, s in picks]
+    save_failure_figure(rows, out_dir / "failures.png")
+    for k, row in enumerate(rows, 1):
+        save_failure_figure([row], out_dir / f"failure_{k}_{row[0].replace(' ', '_')}.png")
     print(f"  failure figures: {', '.join(f'{kind} {s['name']} (dice {slice_dice(s):.2f})' for kind, s in picks)} -> {out_dir}")
+
+def failure_kinds(s, fail_dice, min_stray_px=10):
+    kinds = []
+    if s["region"] >= 0 and slice_dice(s) < fail_dice:
+        kinds.append(REGIONS[s["region"]])
+    if s["true"] > 0 and s["stray_px"] >= min_stray_px:
+        kinds.append("stray blob")
+    if s["true"] == 0 and s["pred"] > 0:
+        kinds.append("beyond the gland")
+    return kinds
+
+def failure_order(kind, s):
+    """worst first: lowest dice for the regions, biggest wrong area for the others"""
+    if kind == "stray blob":
+        return -s["stray_px"]
+    if kind == "beyond the gland":
+        return -s["pred"]
+    return slice_dice(s) - 1e-6 * s["true"]  # the bigger gland breaks dice ties
+
+def all_failures(slices, fail_dice):
+    """kind -> every failing slice of that kind, worst first. a slice failing several kinds is under each of them"""
+    failures = {kind: [] for kind in (*REGIONS, "stray blob", "beyond the gland")}
+    for s in slices:
+        kinds = failure_kinds(s, fail_dice)
+        for kind in kinds:
+            failures[kind].append((" + ".join(kinds), s))
+    return {kind: sorted(rows, key=lambda row: failure_order(kind, row[1])) for kind, rows in failures.items()}
+
+def plot_slices(names, slices, dataset, preds, out_dir, fail_dice):
+    """the failure figure for chosen test slices, e.g. names from all_failures in test_results.json"""
+    by_name = {s["name"]: s for s in slices}
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        raise ValueError(f"not in this run's test split: {', '.join(missing)}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        s = by_name[name]
+        label = " + ".join(failure_kinds(s, fail_dice)) or "slice"
+        save_failure_figure([failure_row(label, s, dataset, preds)], out_dir / f"{name}.png")
+        print(f"  {name} ({label}, dice {slice_dice(s):.2f}) -> {out_dir / f'{name}.png'}")
 
 if __name__ == "__main__":
     args = parse_args()
@@ -300,11 +351,18 @@ if __name__ == "__main__":
         if split not in datasets:  # runs with the same split share the test set
             datasets[split] = test_dataset(train_args)
         results, preds = evaluate(model, datasets[split], device, args.batch_size)
+        if args.slices:  # only draw the chosen slices, leave the saved results and figures alone
+            plot_slices(args.slices, results["slices"], datasets[split], preds, run_dir / "failures" / "slices", args.fail_dice)
+            continue
         print_results(run_dir.name, results)
         results["failure_summary"] = failure_summary(results["slices"])
         picks = pick_failures(results["slices"])
         plot_failures(picks, datasets[split], preds, run_dir / "failures")
         results["failures"] = [{"kind": kind, "name": s["name"]} for kind, s in picks]
+        failures = all_failures(results["slices"], args.fail_dice)
+        print(f"  all failures: {', '.join(f'{kind} {len(rows)}' for kind, rows in failures.items())} -> test_results.json")
+        results["all_failures"] = {kind: [{"kinds": label, "name": s["name"], "dice": slice_dice(s)} for label, s in rows]
+                                   for kind, rows in failures.items()}
         with open(run_dir / "test_results.json", "w") as f:
             json.dump(results, f, indent=1)
         all_results[run_dir.name] = results
