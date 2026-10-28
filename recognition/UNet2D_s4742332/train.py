@@ -20,8 +20,8 @@ import torch.nn as nn
 from dataset import full_load_dataset, DATA_ROOT, CACHE_DIR, N_LABELS
 from modules import UNet2D
 
-LABEL_NAMES = ("background", "body", "femoral hip", "bladder", "rectum", "prostate")
-PROSTATE = 5
+LABELS = {"background": 0, "body": 1, "femoral hip":2, "bladder":3, "rectum":4, "prostate":5}
+REGIONS = ("base", "central", "apex")
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train 2D U-Net on HipMRI prostate slices")
@@ -79,14 +79,33 @@ def dice_counts(logits, mask, n_classes=N_LABELS):
 def dice_from_counts(inter, total, eps=1e-6):
     return ((2 * inter + eps) / (total + eps)).cpu()
 
-def run_epoch(model, loader, loss_fn, device, optimiser=None):
+def prostate_regions(dataset):
+    scans = {}
+    for k, sid in enumerate(dataset.ids):
+        m = np.asarray(dataset.masks[dataset.indices[k]])
+        scans.setdefault((sid.patient, sid.week), []).append((sid.slice, (m == LABELS["prostate"]).any(), (m == LABELS["bladder"]).any()))
+    regions = {}
+    for (patient, week), rows in scans.items():
+        prostate = sorted(s for s, has_p, _ in rows if has_p)
+        bladder = [s for s, _, has_b in rows if has_b]
+        if not prostate:
+            continue
+        if bladder and np.mean(bladder) > np.mean(prostate):
+            prostate.reverse()  # bladder above the high slices, so base starts there
+        for rank, s in enumerate(prostate):
+            regions[f"case_{patient:03d}_week_{week}_slice_{s}"] = 3 * rank // len(prostate)
+    return regions
+
+def run_epoch(model, loader, loss_fn, device, optimiser=None, regions=None):
     training = optimiser is not None
     model.train(training)
     loss_sum, n_seen = 0.0, 0
     inter = torch.zeros(N_LABELS, device=device)
     total = torch.zeros(N_LABELS, device=device)
+    reg_inter = torch.zeros(len(REGIONS), device=device)
+    reg_total = torch.zeros(len(REGIONS), device=device)
     with torch.set_grad_enabled(training):
-        for image, mask, _ in loader:
+        for image, mask, names in loader:
             image = image.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             logits = model(image)
@@ -100,36 +119,52 @@ def run_epoch(model, loader, loss_fn, device, optimiser=None):
             i, t = dice_counts(logits.detach(), mask)
             inter += i
             total += t
-    return loss_sum / n_seen, dice_from_counts(inter, total)
+            if regions is not None:
+                r = torch.tensor([regions.get(n, -1) for n in names], device=device)
+                keep = r >= 0
+                pred_p = (logits.detach().argmax(dim=1) == LABELS["prostate"]).flatten(1)
+                true_p = (mask == LABELS["prostate"]).flatten(1)
+                reg_inter.index_add_(0, r[keep], (pred_p & true_p).sum(1)[keep].float())
+                reg_total.index_add_(0, r[keep], (pred_p.sum(1) + true_p.sum(1))[keep].float())
+    region_dice = dice_from_counts(reg_inter, reg_total) if regions is not None else None
+    return loss_sum / n_seen, dice_from_counts(inter, total), region_dice
 
 def plot_history(history, run_dir):
-    fig, (ax_loss, ax_dice) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, (ax_loss, ax_dice, ax_region) = plt.subplots(1, 3, figsize=(18, 4))
     epochs = range(1, len(history["train_loss"]) + 1)
     ax_loss.plot(epochs, history["train_loss"], label="train")
     ax_loss.plot(epochs, history["val_loss"], label="validate")
     ax_loss.set(xlabel="epoch", ylabel="cross entropy", title="Loss")
     ax_loss.legend()
     val_dice = np.array(history["val_dice"])
-    for c in range(N_LABELS):
-        ax_dice.plot(epochs, val_dice[:, c], label=LABEL_NAMES[c], linewidth=2.5 if c == PROSTATE else 1)
+    for name, c in LABELS.items():
+        ax_dice.plot(epochs, val_dice[:, c], label=name, linewidth=2.5 if c == LABELS["prostate"] else 1)
     ax_dice.axhline(0.75, color="grey", linestyle="--", linewidth=0.8)
     ax_dice.set(xlabel="epoch", ylabel="dice", title="Validation Dice", ylim=(0, 1))
     ax_dice.legend(fontsize=8)
+    region_dice = np.array(history["val_region_dice"])
+    ax_region.plot(epochs, val_dice[:, LABELS["prostate"]], label="whole", linewidth=2.5, color="black")
+    for r, name in enumerate(REGIONS):
+        ax_region.plot(epochs, region_dice[:, r], label=name)
+    ax_region.axhline(0.75, color="grey", linestyle="--", linewidth=0.8)
+    ax_region.set(xlabel="epoch", ylabel="dice", title="Validation prostate Dice by region", ylim=(0, 1))
+    ax_region.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(run_dir / "curves.png", dpi=120)
     plt.close(fig)
 
 def train(args, device, loaders, model, loss_fn, optimiser, run_dir):
-    history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": []}
+    history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": [], "val_region_dice": []}
     best_dice = -1.0
+    regions = prostate_regions(loaders["validate"].dataset)
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss, train_dice = run_epoch(model, loaders["train"], loss_fn, device, optimiser)
-        val_loss, val_dice = run_epoch(model, loaders["validate"], loss_fn, device)
-        for key, value in zip(history, (train_loss, val_loss, train_dice.tolist(), val_dice.tolist())):
+        train_loss, train_dice, _ = run_epoch(model, loaders["train"], loss_fn, device, optimiser)
+        val_loss, val_dice, val_region_dice = run_epoch(model, loaders["validate"], loss_fn, device, regions=regions)
+        for key, value in zip(history, (train_loss, val_loss, train_dice.tolist(), val_dice.tolist(), val_region_dice.tolist())):
             history[key].append(value)
 
-        prostate = val_dice[PROSTATE].item()
+        prostate = val_dice[LABELS["prostate"]].item()
         improved = prostate > best_dice
         if improved:
             best_dice = prostate
@@ -138,8 +173,9 @@ def train(args, device, loaders, model, loss_fn, optimiser, run_dir):
         torch.save({"epoch": epoch, "model": model.state_dict(), "optimiser": optimiser.state_dict()}, run_dir / "last.pt")
 
         print(f"epoch {epoch:3d} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | "
-              f"val dice {' '.join(f'{name} {d:.3f}' for name, d in zip(LABEL_NAMES, val_dice.tolist()))}"
-              f"{' *' if improved else ''} | {time.time() - t0:.0f}s")
+              f"val dice {' '.join(f'{name} {d:.3f}' for name, d in zip(LABELS, val_dice.tolist()))}"
+              f"{' *' if improved else ''} | prostate {' '.join(f'{name} {d:.3f}' for name, d in zip(REGIONS, val_region_dice.tolist()))}"
+              f" | {time.time() - t0:.0f}s")
         with open(run_dir / "history.json", "w") as f:
             json.dump(history, f, indent=1)
         plot_history(history, run_dir)
