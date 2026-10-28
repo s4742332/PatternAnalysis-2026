@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
@@ -45,7 +45,15 @@ class SliceID:
     image_path: Path
     mask_path: Path
 
-def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path):
+def patient_weights(ids: list[SliceID], mode: str):
+    if mode not in ("inverse", "sqrt"):
+        raise ValueError(f"patient_weighting must be None, 'inverse' or 'sqrt', got {mode!r}")
+    n_scans = Counter(p for p, _ in {(s.patient, s.week) for s in ids})
+    power = 1.0 if mode == "inverse" else 0.5
+    return torch.tensor([n_scans[s.patient] ** -power for s in ids], dtype=torch.double)
+
+def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path,
+                      patient_weighting: str | None = None):
     print(f"Loading dataset with seed {seed}")
     all_ids = resplit_patients(build_all_sliceids(root), seed, n_val, n_test)
     pooled = [s for ids in all_ids.values() for s in ids]
@@ -54,9 +62,13 @@ def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_work
     for split, ids in all_ids.items():
         train = split == "train"
         ds = HipMRISlices(ids, pooled, JointTransform2D() if train and augment else None, cache_dir)
-        loaders[split] = DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train, 
+        sampler = None
+        if train and patient_weighting:  # train only, validate/test stay unweighted
+            sampler = WeightedRandomSampler(patient_weights(ids, patient_weighting), num_samples=len(ds),
+                                            replacement=True, generator=generator)
+        loaders[split] = DataLoader(ds, batch_size=batch_size, shuffle=train and sampler is None, sampler=sampler, drop_last=train,
                                     num_workers=num_workers, persistent_workers=num_workers > 0,
-                                    pin_memory=torch.cuda.is_available(), generator=generator if train else None)
+                                    pin_memory=torch.cuda.is_available(), generator=generator if train and sampler is None else None)
     return loaders
 
 # folder work
