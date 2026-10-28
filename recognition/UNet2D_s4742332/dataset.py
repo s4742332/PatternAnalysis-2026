@@ -45,6 +45,20 @@ class SliceID:
     image_path: Path
     mask_path: Path
 
+def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path):
+    print(f"Loading dataset with seed {seed}")
+    all_ids = resplit_patients(build_all_sliceids(root), seed, n_val, n_test)
+    pooled = [s for ids in all_ids.values() for s in ids]
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
+    loaders = {}
+    for split, ids in all_ids.items():
+        train = split == "train"
+        ds = HipMRISlices(ids, pooled, JointTransform2D() if train and augment else None, cache_dir)
+        loaders[split] = DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train, 
+                                    num_workers=num_workers, persistent_workers=num_workers > 0,
+                                    pin_memory=torch.cuda.is_available(), generator=generator if train else None)
+    return loaders
+
 # folder work
 def name_to_paths(root: Path, split: str, name: str):
     """image file name -> (image path, mask path). mask name is the image name with case_ swapped for seg_"""
@@ -362,62 +376,71 @@ class JointTransform2D:
         return image, mask
 
 
+
+
+
 if __name__ == "__main__":
-    all_ids = build_all_sliceids(DATA_ROOT)
-    all_ids = resplit_patients(all_ids, 1, 5, 5)
+    loaders = full_load_dataset(seed=11, batch_size=8, augment=True, num_workers=2, n_val=5, n_test=5, root=DATA_ROOT, cache_dir=CACHE_DIR)
+    for split, loader in loaders.items():
+        images_b, masks_b, names_b = next(iter(loader))
+        print(f"{split:9} slices={len(loader.dataset):5} batches={len(loader):4}  "
+              f"{tuple(images_b.shape)} {images_b.dtype}  {tuple(masks_b.shape)} {masks_b.dtype}  {names_b[0]}")
+
+    # all_ids = build_all_sliceids(DATA_ROOT)
+    # all_ids = resplit_patients(all_ids, 1, 5, 5)
     
-    for split, ids in all_ids.items():
-        summarise_split(split, ids)
-        print("   first:", ids[:3])
+    # for split, ids in all_ids.items():
+    #     summarise_split(split, ids)
+    #     print("   first:", ids[:3])
     
     
         #_ = check_weeks_per_case(split, ids)
         #check_labels(DATA_ROOT / f"keras_slices_seg_{split}")
-    #check_images_manually(all_ids["train"][45])
+    # #check_images_manually(all_ids["train"][45])
 
    
-    pooled = [s for ids in all_ids.values() for s in ids]
-    cropped = next(s for s in pooled if s.patient == 19 and s.week == 1)
-    # for sid in (pooled[0], cropped):
-    #     image, mask = load_slice(sid)
-    #     print(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}: "
-    #           f"image {image.shape} {image.dtype} mean={image.mean():.3f} std={image.std():.3f}  "
-    #           f"mask {mask.shape} {mask.dtype} labels={np.unique(mask)}")
+    # pooled = [s for ids in all_ids.values() for s in ids]
+    # cropped = next(s for s in pooled if s.patient == 19 and s.week == 1)
+    # # for sid in (pooled[0], cropped):
+    # #     image, mask = load_slice(sid)
+    # #     print(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}: "
+    # #           f"image {image.shape} {image.dtype} mean={image.mean():.3f} std={image.std():.3f}  "
+    # #           f"mask {mask.shape} {mask.dtype} labels={np.unique(mask)}")
 
-    # pooled = sorted(pooled)
-    # images, masks = load_cache(pooled)
-    # print("cache:", images.shape, images.dtype, masks.shape, masks.dtype)
-    # for i in (0, pooled.index(cropped), len(pooled) - 1):
-    #     image, mask = load_slice(pooled[i])
-    #     if not (np.array_equal(images[i], image) and np.array_equal(masks[i], mask)):
-    #         raise ValueError(f"cache slice {i} ({pooled[i]}) doesn't match load_slice")
-    # print("cache matches load_slice")
+    # # pooled = sorted(pooled)
+    # # images, masks = load_cache(pooled)
+    # # print("cache:", images.shape, images.dtype, masks.shape, masks.dtype)
+    # # for i in (0, pooled.index(cropped), len(pooled) - 1):
+    # #     image, mask = load_slice(pooled[i])
+    # #     if not (np.array_equal(images[i], image) and np.array_equal(masks[i], mask)):
+    # #         raise ValueError(f"cache slice {i} ({pooled[i]}) doesn't match load_slice")
+    # # print("cache matches load_slice")
 
-    datasets = {split: HipMRISlices(ids, pooled, JointTransform2D() if split == "train" else None)
-                for split, ids in all_ids.items()}
-    for split, ds in datasets.items():
-        image, mask, name = ds[0]
-        print(f"{split:9} len={len(ds):5}  {name}: image {tuple(image.shape)} {image.dtype}  mask {tuple(mask.shape)} {mask.dtype}")
-    loader = DataLoader(datasets["train"], batch_size=8, shuffle=True, num_workers=2) # workers: checks the reopen path
-    images_b, masks_b, names_b = next(iter(loader))
-    print("batch:", tuple(images_b.shape), images_b.dtype, tuple(masks_b.shape), masks_b.dtype, names_b[:2])
+    # datasets = {split: HipMRISlices(ids, pooled, JointTransform2D() if split == "train" else None)
+    #             for split, ids in all_ids.items()}
+    # for split, ds in datasets.items():
+    #     image, mask, name = ds[0]
+    #     print(f"{split:9} len={len(ds):5}  {name}: image {tuple(image.shape)} {image.dtype}  mask {tuple(mask.shape)} {mask.dtype}")
+    # loader = DataLoader(datasets["train"], batch_size=8, shuffle=True, num_workers=2) # workers: checks the reopen path
+    # images_b, masks_b, names_b = next(iter(loader))
+    # print("batch:", tuple(images_b.shape), images_b.dtype, tuple(masks_b.shape), masks_b.dtype, names_b[:2])
 
-    # augmentation check: shapes/dtypes kept, mask labels stay a subset of the original, same seed -> same output
-    plain = HipMRISlices(all_ids["train"], pooled)
-    aug = JointTransform2D()
-    for idx in (0, len(plain) // 2):
-        image, mask, name = plain[idx]
-        torch.manual_seed(0); a_img, a_mask = aug(image, mask)
-        torch.manual_seed(0); b_img, b_mask = aug(image, mask)
-        if a_img.shape != image.shape or a_mask.shape != mask.shape or a_mask.dtype != torch.long:
-            raise ValueError(f"{name}: augmentation changed shape/dtype")
-        if not set(a_mask.unique().tolist()) <= set(mask.unique().tolist()):
-            raise ValueError(f"{name}: augmentation made new labels {a_mask.unique().tolist()}")
-        if not (torch.equal(a_img, b_img) and torch.equal(a_mask, b_mask)):
-            raise ValueError(f"{name}: same seed gave different augmentations")
-        print(f"aug {name}: labels {mask.unique().tolist()} -> {a_mask.unique().tolist()}  "
-              f"fg {(mask > 0).float().mean():.3f} -> {(a_mask > 0).float().mean():.3f}")
-    print("augmentation OK")
+    # # augmentation check: shapes/dtypes kept, mask labels stay a subset of the original, same seed -> same output
+    # plain = HipMRISlices(all_ids["train"], pooled)
+    # aug = JointTransform2D()
+    # for idx in (0, len(plain) // 2):
+    #     image, mask, name = plain[idx]
+    #     torch.manual_seed(0); a_img, a_mask = aug(image, mask)
+    #     torch.manual_seed(0); b_img, b_mask = aug(image, mask)
+    #     if a_img.shape != image.shape or a_mask.shape != mask.shape or a_mask.dtype != torch.long:
+    #         raise ValueError(f"{name}: augmentation changed shape/dtype")
+    #     if not set(a_mask.unique().tolist()) <= set(mask.unique().tolist()):
+    #         raise ValueError(f"{name}: augmentation made new labels {a_mask.unique().tolist()}")
+    #     if not (torch.equal(a_img, b_img) and torch.equal(a_mask, b_mask)):
+    #         raise ValueError(f"{name}: same seed gave different augmentations")
+    #     print(f"aug {name}: labels {mask.unique().tolist()} -> {a_mask.unique().tolist()}  "
+    #           f"fg {(mask > 0).float().mean():.3f} -> {(a_mask > 0).float().mean():.3f}")
+    # print("augmentation OK")
 
 
 
