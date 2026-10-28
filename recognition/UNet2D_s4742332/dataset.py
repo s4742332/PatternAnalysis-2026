@@ -19,7 +19,8 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 from typing import Optional
 
-from torch import tensor
+import torch
+from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
@@ -29,6 +30,7 @@ _NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)\.nii\.gz")
 SPLITS = ("train", "validate", "test")
 H, W = 256, 128 # most slices; 019_week_1 is 256x144 and gets cropped
 N_LABELS = 6
+CACHE_DIR = Path(r"S:\hipmri-cache") # outside the repo, ~2 GB
 
 
 # dataclasses
@@ -130,6 +132,35 @@ def load_slice(sid: SliceID):
     if mask.min() < 0 or mask.max() >= N_LABELS:
         raise ValueError(f"{sid}: labels {np.unique(mask)} outside 0-{N_LABELS - 1}")
     return image, mask.astype(np.uint8)
+
+def build_cache(ids: list[SliceID], cache_dir: Path = CACHE_DIR):
+    ids = sorted(ids)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    keys = np.array([(s.patient, s.week, s.slice) for s in ids], dtype=np.int32)
+    images = np.lib.format.open_memmap(cache_dir / "images.tmp.npy", mode="w+", dtype=np.float32, shape=(len(ids), H, W))
+    masks = np.lib.format.open_memmap(cache_dir / "masks.tmp.npy", mode="w+", dtype=np.uint8, shape=(len(ids), H, W))
+    for i, sid in enumerate(ids):
+        images[i], masks[i] = load_slice(sid)
+        if i % 1000 == 0:
+            print(f"cache {i}/{len(ids)}")
+    images.flush(); masks.flush()
+    del images, masks 
+    os.replace(cache_dir / "images.tmp.npy", cache_dir / "images.npy")
+    os.replace(cache_dir / "masks.tmp.npy", cache_dir / "masks.npy")
+    np.save(cache_dir / "keys.npy", keys)
+    print(f"cache built: {len(ids)} slices -> {cache_dir}")
+
+def load_cache(ids: list[SliceID], cache_dir: Path = CACHE_DIR):
+    ids = sorted(ids) # the cache is always in sorted order, whatever order the caller pooled in
+    if not (cache_dir / "keys.npy").exists():
+        build_cache(ids, cache_dir)
+    keys = np.load(cache_dir / "keys.npy")
+    expected = np.array([(s.patient, s.week, s.slice) for s in ids], dtype=np.int32)
+    if not np.array_equal(keys, expected):
+        raise ValueError(f"cache in {cache_dir} doesn't match these slices, delete it and rebuild")
+    images = np.load(cache_dir / "images.npy", mmap_mode="r") 
+    masks = np.load(cache_dir / "masks.npy", mmap_mode="r")
+    return images, masks
 
 def file_names_in(folder: Path):
     return {f.name for f in folder.iterdir()}
@@ -233,12 +264,43 @@ def correct_dims(*images):
 
 ###
 
+def slice_name(sid: SliceID):
+    return f"case_{sid.patient:03d}_week_{sid.week}_slice_{sid.slice}"
+
 class HipMRISlices(Dataset):
     """
-    2D slices
+    2D slices of one split, read from the cache.
+    split_ids: the SliceIDs of this split, pooled: the sorted SliceIDs of every split (the cache order).
+    joint_transform: callable (image, mask) -> (image, mask) on tensors, applied to both together.
+    returns image [1,H,W] float32, mask [H,W] long, slice name (a str so the DataLoader can batch it)
     """
-    def __init__(self):
-        return
+    def __init__(self, split_ids: list[SliceID], pooled: list[SliceID], joint_transform=None, cache_dir: Path = CACHE_DIR):
+        pooled = sorted(pooled) # cache order, so callers can pool the splits in any order
+        index_of = {s: i for i, s in enumerate(pooled)}
+        self.ids = split_ids
+        self.indices = [index_of[s] for s in split_ids] 
+        self.pooled = pooled
+        self.joint_transform = joint_transform
+        self.cache_dir = cache_dir
+        self.images, self.masks = load_cache(pooled, cache_dir)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["images"] = state["masks"] = None
+        return state
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        if self.images is None: 
+            self.images, self.masks = load_cache(self.pooled, self.cache_dir)
+        i = self.indices[idx]
+        image = torch.from_numpy(np.array(self.images[i])).unsqueeze(0) 
+        mask = to_long_tensor(self.masks[i])
+        if self.joint_transform is not None:
+            image, mask = self.joint_transform(image, mask)
+        return image, mask, slice_name(self.ids[idx])
 
 if __name__ == "__main__":
     all_ids = build_all_sliceids(DATA_ROOT)
@@ -253,11 +315,34 @@ if __name__ == "__main__":
         #check_labels(DATA_ROOT / f"keras_slices_seg_{split}")
     #check_images_manually(all_ids["train"][45])
 
-    # load_slice check: one normal slice and one from 019_week_1 (256x144, gets cropped)
+   
     pooled = [s for ids in all_ids.values() for s in ids]
     cropped = next(s for s in pooled if s.patient == 19 and s.week == 1)
-    for sid in (pooled[0], cropped):
-        image, mask = load_slice(sid)
-        print(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}: "
-              f"image {image.shape} {image.dtype} mean={image.mean():.3f} std={image.std():.3f}  "
-              f"mask {mask.shape} {mask.dtype} labels={np.unique(mask)}")
+    # for sid in (pooled[0], cropped):
+    #     image, mask = load_slice(sid)
+    #     print(f"patient {sid.patient:03d} week {sid.week} slice {sid.slice}: "
+    #           f"image {image.shape} {image.dtype} mean={image.mean():.3f} std={image.std():.3f}  "
+    #           f"mask {mask.shape} {mask.dtype} labels={np.unique(mask)}")
+
+    # pooled = sorted(pooled)
+    # images, masks = load_cache(pooled)
+    # print("cache:", images.shape, images.dtype, masks.shape, masks.dtype)
+    # for i in (0, pooled.index(cropped), len(pooled) - 1):
+    #     image, mask = load_slice(pooled[i])
+    #     if not (np.array_equal(images[i], image) and np.array_equal(masks[i], mask)):
+    #         raise ValueError(f"cache slice {i} ({pooled[i]}) doesn't match load_slice")
+    # print("cache matches load_slice")
+
+    datasets = {split: HipMRISlices(ids, pooled) for split, ids in all_ids.items()}
+    for split, ds in datasets.items():
+        image, mask, name = ds[0]
+        print(f"{split:9} len={len(ds):5}  {name}: image {tuple(image.shape)} {image.dtype}  mask {tuple(mask.shape)} {mask.dtype}")
+    loader = DataLoader(datasets["train"], batch_size=8, shuffle=True, num_workers=2) # workers: checks the reopen path
+    images_b, masks_b, names_b = next(iter(loader))
+    print("batch:", tuple(images_b.shape), images_b.dtype, tuple(masks_b.shape), masks_b.dtype, names_b[:2])
+
+
+
+
+
+
