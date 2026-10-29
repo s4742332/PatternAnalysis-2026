@@ -57,7 +57,7 @@ def load_model(checkpoint_path, device):
     if "args" not in ckpt:
         raise ValueError(f"{checkpoint_path} has no saved args, use best.pt rather than last.pt")
     args = ckpt["args"]
-    model = UNet2D(1, N_LABELS, conv_depths=tuple(args["conv_depths"]), skip_connected=args["skip_connected"]).to(device)
+    model = UNet2D(1 + 2 * args.get("context", 0), N_LABELS, conv_depths=tuple(args["conv_depths"]), skip_connected=args["skip_connected"]).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, args, ckpt
@@ -71,7 +71,7 @@ def eval_dataset(train_args, split):
     """the run's held-out test (or validate) patients, rebuilt from its saved seed and split sizes, no augmentation"""
     loaders = full_load_dataset(seed=train_args["seed"], batch_size=1, augment=False, num_workers=0,
                                 n_val=train_args["n_val"], n_test=train_args["n_test"], root=DATA_ROOT, cache_dir=CACHE_DIR,
-                                resplit=not train_args.get("original_split", False))
+                                resplit=not train_args.get("original_split", False), context=train_args.get("context", 0))
     return loaders[split].dataset
 
 def cases_in(dataset):
@@ -134,7 +134,7 @@ def evaluate(model, dataset, device, batch_size, low=None):
     reg_inter, reg_total = (torch.zeros(len(REGIONS), device=device) for _ in range(2))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    model(torch.zeros(batch_size, 1, H, W, device=device))  # warm-up so cuDNN set-up isn't timed in the first case
+    model(torch.zeros(batch_size, 1 + 2 * dataset.context, H, W, device=device))  # warm-up so cuDNN set-up isn't timed in the first case
     sync(device)
 
     cases, slices = [], []
@@ -320,7 +320,8 @@ def plot_failure_row(axes, kind, s, image, mask, pred):
                  transform=axes[0].transAxes, ha="right", va="center", fontsize=8)
 
 def failure_row(kind, s, dataset, preds):
-    image, mask = (t.squeeze(0).numpy() for t in dataset[s["index"]][:2])
+    image, mask = dataset[s["index"]][:2]
+    image, mask = image[dataset.context].numpy(), mask.numpy()  # centre slice of a 2.5D stack
     return kind, s, image, mask, preds[s["index"]]
 
 def save_failure_figure(rows, path):
@@ -396,6 +397,7 @@ if __name__ == "__main__":
             split = "original"
         else:
             split = (train_args["seed"], train_args["n_val"], train_args["n_test"])
+        split = (split, train_args.get("context", 0))  # 2D and 2.5D runs need their own datasets
         if split not in datasets:  # runs with the same split share the test set
             datasets[split] = eval_dataset(train_args, args.split)
         dataset = datasets[split]

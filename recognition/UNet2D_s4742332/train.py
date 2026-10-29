@@ -42,6 +42,8 @@ def parse_args():
                    help="ce_dice adds a soft Dice term on the foreground classes so small structures like the apex count")
     p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
                    help="cosine decays the lr from --lr to 0 over --epochs")
+    p.add_argument("--context", type=int, default=0,
+                   help="2.5D: neighbouring slices on each side fed as extra input channels, 1 -> slices k-1, k, k+1")
     p.add_argument("--original-split", action="store_true",
                    help="keep the dataset's own train/validate/test patients, --n-val/--n-test are ignored")
     p.add_argument("--oversample-ends", type=float, default=None, metavar="FACTOR",
@@ -61,9 +63,9 @@ def setup(args):
                                 num_workers=args.num_workers, n_val=args.n_val, n_test=args.n_test,
                                 root=DATA_ROOT, cache_dir=CACHE_DIR, patient_weighting=args.patient_weighting,
                                 slice_weights=(lambda ds: end_weights(ds, args.oversample_ends)) if args.oversample_ends else None,
-                                resplit=not args.original_split)
+                                resplit=not args.original_split, context=args.context)
 
-    model = UNet2D(1, N_LABELS, conv_depths=tuple(args.conv_depths), skip_connected=args.skip_connected).to(device)
+    model = UNet2D(1 + 2 * args.context, N_LABELS, conv_depths=tuple(args.conv_depths), skip_connected=args.skip_connected).to(device)
     loss_fn = CEDiceLoss() if args.loss == "ce_dice" else nn.CrossEntropyLoss()
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -76,6 +78,8 @@ def setup(args):
         run_name += f"_ends{args.oversample_ends:g}"
     if args.original_split:
         run_name += "_origsplit"
+    if args.context:
+        run_name += f"_ctx{args.context}"
     run_dir = args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 

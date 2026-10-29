@@ -53,9 +53,10 @@ def patient_weights(ids: list[SliceID], mode: str):
     return torch.tensor([n_scans[s.patient] ** -power for s in ids], dtype=torch.double)
 
 def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path,
-                      patient_weighting: str | None = None, slice_weights=None, resplit: bool = True):
+                      patient_weighting: str | None = None, slice_weights=None, resplit: bool = True, context: int = 0):
     """slice_weights: optional callable (train dataset) -> tensor of per-slice sampling weights, multiplied with the patient weights.
-    resplit=False keeps the provided train/validate/test patients, seed then only drives shuffling"""
+    resplit=False keeps the provided train/validate/test patients, seed then only drives shuffling.
+    context: neighbouring slices on each side stacked as extra channels (2.5D), 0 = plain 2D"""
     print(f"Loading dataset with seed {seed}")
     all_ids = build_all_sliceids(root)
     if resplit:
@@ -65,7 +66,7 @@ def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_work
     loaders = {}
     for split, ids in all_ids.items():
         train = split == "train"
-        ds = HipMRISlices(ids, pooled, JointTransform2D() if train and augment else None, cache_dir)
+        ds = HipMRISlices(ids, pooled, JointTransform2D() if train and augment else None, cache_dir, context)
         sampler = None
         if train and (patient_weighting or slice_weights):  # train only, validate/test stay unweighted
             weights = torch.ones(len(ds), dtype=torch.double)
@@ -306,13 +307,17 @@ class HipMRISlices(Dataset):
     2D slices of one split, read from the cache.
     split_ids: the SliceIDs of this split, pooled: the sorted SliceIDs of every split (the cache order).
     joint_transform: callable (image, mask) -> (image, mask) on tensors, applied to both together.
-    returns image [1,H,W] float32, mask [H,W] long, slice name (a str so the DataLoader can batch it)
+    context: neighbouring slices on each side of the same scan stacked around it (2.5D), the edge slice repeats past the scan's ends.
+    returns image [1+2*context,H,W] float32 (centre slice in the middle), mask [H,W] long (centre slice), slice name (a str so the DataLoader can batch it)
     """
-    def __init__(self, split_ids: list[SliceID], pooled: list[SliceID], joint_transform=None, cache_dir: Path = CACHE_DIR):
+    def __init__(self, split_ids: list[SliceID], pooled: list[SliceID], joint_transform=None, cache_dir: Path = CACHE_DIR, context: int = 0):
         pooled = sorted(pooled) # cache order, so callers can pool the splits in any order
         index_of = {s: i for i, s in enumerate(pooled)}
         self.ids = split_ids
-        self.indices = [index_of[s] for s in split_ids] 
+        self.indices = [index_of[s] for s in split_ids]
+        key_index = {(s.patient, s.week, s.slice): i for i, s in enumerate(pooled)}
+        self.stacks = [[self.neighbour(key_index, s, o) for o in range(-context, context + 1)] for s in split_ids]
+        self.context = context
         self.pooled = pooled
         self.joint_transform = joint_transform
         self.cache_dir = cache_dir
@@ -323,14 +328,22 @@ class HipMRISlices(Dataset):
         state["images"] = state["masks"] = None
         return state
 
+    @staticmethod
+    def neighbour(key_index, sid: SliceID, offset: int):
+        """cache index of the slice offset away in the same scan, stepping back towards sid while that slice doesn't exist"""
+        step = -1 if offset > 0 else 1
+        while (sid.patient, sid.week, sid.slice + offset) not in key_index:
+            offset += step
+        return key_index[(sid.patient, sid.week, sid.slice + offset)]
+
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        if self.images is None: 
+        if self.images is None:
             self.images, self.masks = load_cache(self.pooled, self.cache_dir)
         i = self.indices[idx]
-        image = torch.from_numpy(np.array(self.images[i])).unsqueeze(0) 
+        image = torch.from_numpy(np.stack([self.images[j] for j in self.stacks[idx]]))
         mask = to_long_tensor(self.masks[i])
         if self.joint_transform is not None:
             image, mask = self.joint_transform(image, mask)
