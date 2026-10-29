@@ -9,11 +9,27 @@ In prostate radiotherapy planning, imaging specalist must be able to correctly c
 
 ### 2D U-Net Architecture
 
+![](https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/u-net-architecture.png)
 
+*Image: U-Net Architecture courtsey of [Dept. of Computer Science Univerisity of Freiburg](https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/)*
+
+The U-Net CNN architecture was initally created by Ronneberger for the ISBI challegne fro segmentation of neuronal structures in electron microscopic stacks, a biomedical segmentation problems and thus makes it an ideal solution to the presented problem. The base architecture of a U-Net CNN consists of a symmetry encoder and decoder with skip connections connecting the layers between each. 
 
 ## Solution
 
 ### Dependencies
+
+The following versions of dependencies are required:
+
+```
+Python:
+torch:
+torchvision:
+nibabel:
+numpy:
+matplotlib:
+```
+
 
 ### Reproducibility
 
