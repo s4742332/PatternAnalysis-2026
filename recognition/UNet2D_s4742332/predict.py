@@ -306,7 +306,6 @@ def failure_kinds(s, fail_dice, min_stray_px=10):
     return kinds
 
 def failure_order(kind, s):
-    """worst first: lowest dice for the regions, biggest wrong area for the others"""
     if kind == "stray blob":
         return -s["stray_px"]
     if kind == "beyond the gland":
@@ -314,7 +313,6 @@ def failure_order(kind, s):
     return slice_dice(s) - 1e-6 * s["true"]  # the bigger gland breaks dice ties
 
 def all_failures(slices, fail_dice):
-    """kind -> every failing slice of that kind, worst first. a slice failing several kinds is under each of them"""
     failures = {kind: [] for kind in (*REGIONS, "stray blob", "beyond the gland")}
     for s in slices:
         kinds = failure_kinds(s, fail_dice)
@@ -323,7 +321,6 @@ def all_failures(slices, fail_dice):
     return {kind: sorted(rows, key=lambda row: failure_order(kind, row[1])) for kind, rows in failures.items()}
 
 def plot_slices(names, slices, dataset, preds, out_dir, fail_dice):
-    """the failure figure for chosen test slices, e.g. names from all_failures in test_results.json"""
     by_name = {s["name"]: s for s in slices}
     missing = [n for n in names if n not in by_name]
     if missing:

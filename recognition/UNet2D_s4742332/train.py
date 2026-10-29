@@ -38,6 +38,10 @@ def parse_args():
     p.add_argument("--patient-weighting", choices=["sqrt", "inverse"], default=None)
     p.add_argument("--conv-depths", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
     p.add_argument("--out-dir", type=Path, default=Path("runs"))
+    p.add_argument("--loss", choices=["ce", "ce_dice"], default="ce",
+                   help="ce_dice adds a soft Dice term on the foreground classes so small structures like the apex count")
+    p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
+                   help="cosine decays the lr from --lr to 0 over --epochs")
     return p.parse_args()
 
 def set_seed(seed: int):
@@ -54,10 +58,15 @@ def setup(args):
                                 root=DATA_ROOT, cache_dir=CACHE_DIR, patient_weighting=args.patient_weighting)
 
     model = UNet2D(1, N_LABELS, conv_depths=tuple(args.conv_depths), skip_connected=args.skip_connected).to(device)
-    loss_fn = nn.CrossEntropyLoss() 
+    loss_fn = CEDiceLoss() if args.loss == "ce_dice" else nn.CrossEntropyLoss()
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     run_name = f"{'skip' if args.skip_connected else 'noskip'}_pw-{args.patient_weighting}_seed{args.seed}"
+    # only non-default settings go in the name, so the older runs keep theirs
+    if args.loss != "ce":
+        run_name += f"_{args.loss}"
+    if args.lr_schedule != "none":
+        run_name += f"_{args.lr_schedule}"
     run_dir = args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -65,6 +74,23 @@ def setup(args):
     print(f"{run_name} on {device}, {n_params:.2f}M params, "
           + ", ".join(f"{s}: {len(l)} batches" for s, l in loaders.items()))
     return device, loaders, model, loss_fn, optimiser, run_dir
+
+class CEDiceLoss(nn.Module):
+    """cross entropy + (1 - mean soft Dice over the foreground classes).
+    Dice is summed over the whole batch, so a class missing from one slice doesn't blow up"""
+    def __init__(self, n_classes=N_LABELS, smooth=1.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.n_classes = n_classes
+        self.smooth = smooth
+
+    def forward(self, logits, mask):
+        probs = logits.softmax(dim=1)[:, 1:]  # background left out, it would dominate the mean
+        target = nn.functional.one_hot(mask, self.n_classes).permute(0, 3, 1, 2)[:, 1:].float()
+        inter = (probs * target).sum(dim=(0, 2, 3))
+        total = probs.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3))
+        dice = (2 * inter + self.smooth) / (total + self.smooth)
+        return self.ce(logits, mask) + (1 - dice.mean())
 
 def dice_counts(logits, mask, n_classes=N_LABELS):
     pred = logits.argmax(dim=1)
@@ -134,7 +160,7 @@ def plot_history(history, run_dir):
     epochs = range(1, len(history["train_loss"]) + 1)
     ax_loss.plot(epochs, history["train_loss"], label="train")
     ax_loss.plot(epochs, history["val_loss"], label="validate")
-    ax_loss.set(xlabel="epoch", ylabel="cross entropy", title="Loss")
+    ax_loss.set(xlabel="epoch", ylabel="loss", title="Loss")
     ax_loss.legend()
     val_dice = np.array(history["val_dice"])
     for name, c in LABELS.items():
@@ -154,14 +180,18 @@ def plot_history(history, run_dir):
     plt.close(fig)
 
 def train(args, device, loaders, model, loss_fn, optimiser, run_dir):
-    history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": [], "val_region_dice": []}
+    history = {"train_loss": [], "val_loss": [], "train_dice": [], "val_dice": [], "val_region_dice": [], "lr": []}
     best_dice = -1.0
     regions = prostate_regions(loaders["validate"].dataset)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs) if args.lr_schedule == "cosine" else None
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
+        lr = optimiser.param_groups[0]["lr"]
         train_loss, train_dice, _ = run_epoch(model, loaders["train"], loss_fn, device, optimiser)
         val_loss, val_dice, val_region_dice = run_epoch(model, loaders["validate"], loss_fn, device, regions=regions)
-        for key, value in zip(history, (train_loss, val_loss, train_dice.tolist(), val_dice.tolist(), val_region_dice.tolist())):
+        if scheduler is not None:
+            scheduler.step()
+        for key, value in zip(history, (train_loss, val_loss, train_dice.tolist(), val_dice.tolist(), val_region_dice.tolist(), lr)):
             history[key].append(value)
 
         prostate = val_dice[LABELS["prostate"]].item()
@@ -175,7 +205,7 @@ def train(args, device, loaders, model, loss_fn, optimiser, run_dir):
         print(f"epoch {epoch:3d} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | "
               f"val dice {' '.join(f'{name} {d:.3f}' for name, d in zip(LABELS, val_dice.tolist()))}"
               f"{' *' if improved else ''} | prostate {' '.join(f'{name} {d:.3f}' for name, d in zip(REGIONS, val_region_dice.tolist()))}"
-              f" | {time.time() - t0:.0f}s")
+              f" | lr {lr:.2e} | {time.time() - t0:.0f}s")
         with open(run_dir / "history.json", "w") as f:
             json.dump(history, f, indent=1)
         plot_history(history, run_dir)
