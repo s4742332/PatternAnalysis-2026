@@ -42,6 +42,8 @@ def parse_args():
                    help="ce_dice adds a soft Dice term on the foreground classes so small structures like the apex count")
     p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
                    help="cosine decays the lr from --lr to 0 over --epochs")
+    p.add_argument("--original-split", action="store_true",
+                   help="keep the dataset's own train/validate/test patients, --n-val/--n-test are ignored")
     p.add_argument("--oversample-ends", type=float, default=None, metavar="FACTOR",
                    help="draw base and apex prostate slices FACTOR times as often as the rest, epochs stay the same length")
     return p.parse_args()
@@ -58,7 +60,8 @@ def setup(args):
     loaders = full_load_dataset(seed=args.seed, batch_size=args.batch_size, augment=args.augment,
                                 num_workers=args.num_workers, n_val=args.n_val, n_test=args.n_test,
                                 root=DATA_ROOT, cache_dir=CACHE_DIR, patient_weighting=args.patient_weighting,
-                                slice_weights=(lambda ds: end_weights(ds, args.oversample_ends)) if args.oversample_ends else None)
+                                slice_weights=(lambda ds: end_weights(ds, args.oversample_ends)) if args.oversample_ends else None,
+                                resplit=not args.original_split)
 
     model = UNet2D(1, N_LABELS, conv_depths=tuple(args.conv_depths), skip_connected=args.skip_connected).to(device)
     loss_fn = CEDiceLoss() if args.loss == "ce_dice" else nn.CrossEntropyLoss()
@@ -71,6 +74,8 @@ def setup(args):
         run_name += f"_{args.lr_schedule}"
     if args.oversample_ends:
         run_name += f"_ends{args.oversample_ends:g}"
+    if args.original_split:
+        run_name += "_origsplit"
     run_dir = args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 

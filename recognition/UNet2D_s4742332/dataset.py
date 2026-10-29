@@ -53,10 +53,13 @@ def patient_weights(ids: list[SliceID], mode: str):
     return torch.tensor([n_scans[s.patient] ** -power for s in ids], dtype=torch.double)
 
 def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path,
-                      patient_weighting: str | None = None, slice_weights=None):
-    """slice_weights: optional callable (train dataset) -> tensor of per-slice sampling weights, multiplied with the patient weights"""
+                      patient_weighting: str | None = None, slice_weights=None, resplit: bool = True):
+    """slice_weights: optional callable (train dataset) -> tensor of per-slice sampling weights, multiplied with the patient weights.
+    resplit=False keeps the provided train/validate/test patients, seed then only drives shuffling"""
     print(f"Loading dataset with seed {seed}")
-    all_ids = resplit_patients(build_all_sliceids(root), seed, n_val, n_test)
+    all_ids = build_all_sliceids(root)
+    if resplit:
+        all_ids = resplit_patients(all_ids, seed, n_val, n_test)
     pooled = [s for ids in all_ids.values() for s in ids]
     generator = torch.Generator().manual_seed(seed) if seed is not None else None
     loaders = {}

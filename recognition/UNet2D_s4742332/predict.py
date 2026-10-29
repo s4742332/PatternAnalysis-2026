@@ -36,6 +36,11 @@ def parse_args():
     p.add_argument("--fail-dice", type=float, default=0.5, help="prostate slices below this dice are listed as failures")
     p.add_argument("--slices", nargs="+", metavar="NAME",
                    help="only draw these test slices (e.g. case_010_week_5_slice_17) into <run>/failures/slices/")
+    p.add_argument("--split", choices=["test", "validate"], default="test",
+                   help="validate to choose settings like --hysteresis without looking at test")
+    p.add_argument("--hysteresis", type=float, nargs="+", metavar="LOW",
+                   help="also evaluate with 3D hysteresis: argmax prostate grows into touching pixels, on the same or a neighbouring slice, "
+                        "with prostate probability > LOW. several values sweep them, plain argmax is always evaluated first")
     args = p.parse_args()
     # PowerShell passes wildcards through unexpanded, so expand runs/* here
     run_dirs = []
@@ -62,11 +67,12 @@ def val_region_dice(run_dir, epoch):
     with open(run_dir / "history.json") as f:
         return json.load(f)["val_region_dice"][epoch - 1]
 
-def test_dataset(train_args):
-    """the run's held-out test patients, rebuilt from its saved seed and split sizes, no augmentation"""
+def eval_dataset(train_args, split):
+    """the run's held-out test (or validate) patients, rebuilt from its saved seed and split sizes, no augmentation"""
     loaders = full_load_dataset(seed=train_args["seed"], batch_size=1, augment=False, num_workers=0,
-                                n_val=train_args["n_val"], n_test=train_args["n_test"], root=DATA_ROOT, cache_dir=CACHE_DIR)
-    return loaders["test"].dataset
+                                n_val=train_args["n_val"], n_test=train_args["n_test"], root=DATA_ROOT, cache_dir=CACHE_DIR,
+                                resplit=not train_args.get("original_split", False))
+    return loaders[split].dataset
 
 def cases_in(dataset):
     """(patient, week) -> dataset indices of that scan's slices, a case is one weekly scan"""
@@ -98,14 +104,31 @@ def connected_components(mask):
             return labels.squeeze(1).long()
         labels = spread
 
+def hysteresis(pred, prob, low):
+    """pred [S,H,W] argmax of one scan's slices in order, prob [S,H,W] prostate probability.
+    argmax prostate is the seed, it grows into touching pixels (26-connected, so across neighbouring slices too)
+    with prob > low. faint pixels not touching a seed stay as they were.
+    only slices where argmax found no prostate take the grown pixels, growing on found slices just inflated their outlines"""
+    seed = pred == LABELS["prostate"]
+    keep = ((prob > low) | seed).float()[None, None]
+    grown = seed.float()[None, None]
+    while True:
+        spread = F.max_pool3d(grown, kernel_size=3, stride=1, padding=1) * keep
+        if torch.equal(spread, grown):
+            break
+        grown = spread
+    empty = ~seed.flatten(1).any(dim=1)  # slices argmax left without prostate
+    return torch.where(grown[0, 0].bool() & empty[:, None, None], LABELS["prostate"], pred)
+
 def sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
 @torch.no_grad()
-def evaluate(model, dataset, device, batch_size):
+def evaluate(model, dataset, device, batch_size, low=None):
     """Dice/IoU per class over the whole split, base/central/apex prostate Dice, per-case prostate Dice,
-    peak VRAM and per-case inference time (upload + forward + argmax, data loading not counted)"""
+    peak VRAM and per-case inference time (upload + forward + argmax + hysteresis, data loading not counted).
+    low: hysteresis threshold, None for plain argmax"""
     regions = prostate_regions(dataset)
     inter, pred_sum, true_sum = (torch.zeros(N_LABELS, device=device) for _ in range(3))
     reg_inter, reg_total = (torch.zeros(len(REGIONS), device=device) for _ in range(2))
@@ -121,8 +144,10 @@ def evaluate(model, dataset, device, batch_size):
         images, masks = torch.stack(images), torch.stack(masks)
         sync(device)
         t0 = time.perf_counter()
-        pred = torch.cat([model(images[i:i + batch_size].to(device)).argmax(dim=1)
-                          for i in range(0, len(idx), batch_size)])
+        logits = torch.cat([model(images[i:i + batch_size].to(device)) for i in range(0, len(idx), batch_size)])
+        pred = logits.argmax(dim=1)
+        if low is not None:
+            pred = hysteresis(pred, logits.softmax(dim=1)[:, LABELS["prostate"]], low)
         sync(device)
         seconds = time.perf_counter() - t0
 
@@ -159,11 +184,11 @@ def evaluate(model, dataset, device, batch_size):
     return {"dice": dice.tolist(), "iou": iou.tolist(), "region_dice": region_dice.tolist(),
             "peak_vram_gb": peak_vram, "batch_size": batch_size, "cases": cases, "slices": slices}, preds
 
-def print_results(name, results):
+def print_results(name, split, results):
     seconds = np.array([c["seconds"] for c in results["cases"]])
     slices = np.array([c["slices"] for c in results["cases"]])
     case_dice = np.array([c["prostate_dice"] for c in results["cases"]])
-    print(f"\n{name} test: {len(results['cases'])} cases, {slices.sum()} slices")
+    print(f"\n{name} {split}: {len(results['cases'])} cases, {slices.sum()} slices")
     print(f"  {'class':12} {'dice':>6} {'iou':>6}")
     for label, c in LABELS.items():
         print(f"  {label:12} {results['dice'][c]:6.3f} {results['iou'][c]:6.3f}")
@@ -173,14 +198,15 @@ def print_results(name, results):
           f"({1000 * seconds.sum() / slices.sum():.1f} ms per slice, batch {results['batch_size']})")
 
 def print_comparison(all_results):
-    print(f"\n{'run':24} {'pros dice':>9} {'pros iou':>8} {'base':>6} {'central':>7} {'apex':>6} {'case dice':>13} "
+    w = max(len(name) for name in all_results)
+    print(f"\n{'run':{w}} {'pros dice':>9} {'pros iou':>8} {'base':>6} {'central':>7} {'apex':>6} {'case dice':>13} "
           f"{'prec':>6} {'recall':>6} {'FP px':>6} {'VRAM GB':>7} {'ms/case':>7}")
     for name, r in all_results.items():
         case_dice = np.array([c["prostate_dice"] for c in r["cases"]])
         ms = 1000 * np.mean([c["seconds"] for c in r["cases"]])
         pr = LABELS["prostate"]
         f = r["failure_summary"]
-        print(f"{name:24} {r['dice'][pr]:9.3f} {r['iou'][pr]:8.3f} "
+        print(f"{name:{w}} {r['dice'][pr]:9.3f} {r['iou'][pr]:8.3f} "
               f"{r['region_dice'][0]:6.3f} {r['region_dice'][1]:7.3f} {r['region_dice'][2]:6.3f} "
               f"{case_dice.mean():6.3f}+/-{case_dice.std():.3f} {f['precision']:6.3f} {f['recall']:6.3f} {f['fp_px']['total']:6d} "
               f"{r['peak_vram_gb']:7.2f} {ms:7.0f}")
@@ -366,25 +392,35 @@ if __name__ == "__main__":
               f"seed {train_args['seed']}, val prostate dice {ckpt['val_dice'][LABELS['prostate']]:.3f} "
               f"({' '.join(f'{name} {d:.3f}' for name, d in zip(REGIONS, val_region_dice(run_dir, ckpt['epoch'])))})")
 
-        split = (train_args["seed"], train_args["n_val"], train_args["n_test"])
+        if train_args.get("original_split", False):
+            split = "original"
+        else:
+            split = (train_args["seed"], train_args["n_val"], train_args["n_test"])
         if split not in datasets:  # runs with the same split share the test set
-            datasets[split] = test_dataset(train_args)
-        results, preds = evaluate(model, datasets[split], device, args.batch_size)
-        if args.slices:  # only draw the chosen slices, leave the saved results and figures alone
-            plot_slices(args.slices, results["slices"], datasets[split], preds, run_dir / "failures" / "slices", args.fail_dice)
-            continue
-        print_results(run_dir.name, results)
-        results["failure_summary"] = failure_summary(results["slices"])
-        picks = pick_failures(results["slices"])
-        plot_failures(picks, datasets[split], preds, run_dir / "failures")
-        results["failures"] = [{"kind": kind, "name": s["name"]} for kind, s in picks]
-        failures = all_failures(results["slices"], args.fail_dice)
-        print(f"  all failures: {', '.join(f'{kind} {len(rows)}' for kind, rows in failures.items())} -> test_results.json")
-        results["all_failures"] = {kind: [{"kinds": label, "name": s["name"], "dice": slice_dice(s)} for label, s in rows]
-                                   for kind, rows in failures.items()}
-        with open(run_dir / "test_results.json", "w") as f:
-            json.dump(results, f, indent=1)
-        all_results[run_dir.name] = results
+            datasets[split] = eval_dataset(train_args, args.split)
+        dataset = datasets[split]
+        for low in [None, *(args.hysteresis or [])]:
+            # plain test keeps the old file names, validate and hysteresis get their own so nothing is overwritten
+            tag = f"_hyst{low:g}" if low is not None else ""
+            out_tag = ("" if args.split == "test" else f"_{args.split}") + tag
+            results, preds = evaluate(model, dataset, device, args.batch_size, low)
+            if args.slices:  # only draw the chosen slices, leave the saved results and figures alone
+                plot_slices(args.slices, results["slices"], dataset, preds, run_dir / f"failures{out_tag}" / "slices", args.fail_dice)
+                continue
+            name = run_dir.name + tag
+            print_results(name, args.split, results)
+            results["failure_summary"] = failure_summary(results["slices"])
+            picks = pick_failures(results["slices"])
+            plot_failures(picks, dataset, preds, run_dir / f"failures{out_tag}")
+            results["failures"] = [{"kind": kind, "name": s["name"]} for kind, s in picks]
+            failures = all_failures(results["slices"], args.fail_dice)
+            results_file = f"{args.split}_results{tag}.json"
+            print(f"  all failures: {', '.join(f'{kind} {len(rows)}' for kind, rows in failures.items())} -> {results_file}")
+            results["all_failures"] = {kind: [{"kinds": label, "name": s["name"], "dice": slice_dice(s)} for label, s in rows]
+                                       for kind, rows in failures.items()}
+            with open(run_dir / results_file, "w") as f:
+                json.dump(results, f, indent=1)
+            all_results[name] = results
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
