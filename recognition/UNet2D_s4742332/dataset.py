@@ -53,7 +53,8 @@ def patient_weights(ids: list[SliceID], mode: str):
     return torch.tensor([n_scans[s.patient] ** -power for s in ids], dtype=torch.double)
 
 def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_workers: int, n_val: int, n_test: int, root: Path, cache_dir: Path,
-                      patient_weighting: str | None = None):
+                      patient_weighting: str | None = None, slice_weights=None):
+    """slice_weights: optional callable (train dataset) -> tensor of per-slice sampling weights, multiplied with the patient weights"""
     print(f"Loading dataset with seed {seed}")
     all_ids = resplit_patients(build_all_sliceids(root), seed, n_val, n_test)
     pooled = [s for ids in all_ids.values() for s in ids]
@@ -63,9 +64,13 @@ def full_load_dataset(seed: int | None, batch_size: int, augment: bool, num_work
         train = split == "train"
         ds = HipMRISlices(ids, pooled, JointTransform2D() if train and augment else None, cache_dir)
         sampler = None
-        if train and patient_weighting:  # train only, validate/test stay unweighted
-            sampler = WeightedRandomSampler(patient_weights(ids, patient_weighting), num_samples=len(ds),
-                                            replacement=True, generator=generator)
+        if train and (patient_weighting or slice_weights):  # train only, validate/test stay unweighted
+            weights = torch.ones(len(ds), dtype=torch.double)
+            if patient_weighting:
+                weights *= patient_weights(ids, patient_weighting)
+            if slice_weights:
+                weights *= slice_weights(ds)
+            sampler = WeightedRandomSampler(weights, num_samples=len(ds), replacement=True, generator=generator)
         loaders[split] = DataLoader(ds, batch_size=batch_size, shuffle=train and sampler is None, sampler=sampler, drop_last=train,
                                     num_workers=num_workers, persistent_workers=num_workers > 0,
                                     pin_memory=torch.cuda.is_available(), generator=generator if train and sampler is None else None)

@@ -173,14 +173,17 @@ def print_results(name, results):
           f"({1000 * seconds.sum() / slices.sum():.1f} ms per slice, batch {results['batch_size']})")
 
 def print_comparison(all_results):
-    print(f"\n{'run':24} {'pros dice':>9} {'pros iou':>8} {'base':>6} {'central':>7} {'apex':>6} {'case dice':>13} {'VRAM GB':>7} {'ms/case':>7}")
+    print(f"\n{'run':24} {'pros dice':>9} {'pros iou':>8} {'base':>6} {'central':>7} {'apex':>6} {'case dice':>13} "
+          f"{'prec':>6} {'recall':>6} {'FP px':>6} {'VRAM GB':>7} {'ms/case':>7}")
     for name, r in all_results.items():
         case_dice = np.array([c["prostate_dice"] for c in r["cases"]])
         ms = 1000 * np.mean([c["seconds"] for c in r["cases"]])
         pr = LABELS["prostate"]
+        f = r["failure_summary"]
         print(f"{name:24} {r['dice'][pr]:9.3f} {r['iou'][pr]:8.3f} "
               f"{r['region_dice'][0]:6.3f} {r['region_dice'][1]:7.3f} {r['region_dice'][2]:6.3f} "
-              f"{case_dice.mean():6.3f}+/-{case_dice.std():.3f} {r['peak_vram_gb']:7.2f} {ms:7.0f}")
+              f"{case_dice.mean():6.3f}+/-{case_dice.std():.3f} {f['precision']:6.3f} {f['recall']:6.3f} {f['fp_px']['total']:6d} "
+              f"{r['peak_vram_gb']:7.2f} {ms:7.0f}")
 
 def slice_dice(s, eps=1e-6):
     return (2 * s["inter"] + eps) / (s["pred"] + s["true"] + eps)
@@ -210,6 +213,7 @@ def failure_summary(slices):
         "beyond_gland_median_px": float(np.median([s["pred"] for s in beyond])) if beyond else 0.0,
         "stray_blob_slices": len(stray),
         "median_slice_dice": {r: float(np.median([slice_dice(s) for s in gland if s["region"] == k])) for k, r in enumerate(REGIONS)},
+        **false_positives(slices, side),
     }
     print(f"  failure summary: {len(gland)} slices with prostate, {len(missed)} missed entirely "
           f"({', '.join(f'{r} {n}' for r, n in summary['missed'].items())})")
@@ -217,7 +221,25 @@ def failure_summary(slices):
           f"({', '.join(f'past {r} {n}' for r, n in summary['beyond_gland'].items())}, median {summary['beyond_gland_median_px']:.0f} px)")
     print(f"    {len(stray)} prostate slices with stray blobs, median slice dice "
           f"{' '.join(f'{r} {d:.3f}' for r, d in summary['median_slice_dice'].items())}")
+    fp = summary["fp_px"]
+    print(f"    false positive prostate: {fp['total']} px, {summary['fp_share']:.1%} of predicted prostate "
+          f"(precision {summary['precision']:.3f}, recall {summary['recall']:.3f}) | "
+          f"on gland slices {' '.join(f'{r} {fp[r]}' for r in REGIONS)} | past base {fp['past base']} past apex {fp['past apex']}")
     return summary
+
+def false_positives(slices, side):
+    """prostate predicted where there is none, in pixels: spill-over on gland slices by region, and on slices past the gland"""
+    fp_px = {r: 0 for r in (*REGIONS, "past base", "past apex")}
+    for s in slices:
+        fp = s["pred"] - s["inter"]
+        if s["region"] >= 0:
+            fp_px[REGIONS[s["region"]]] += fp
+        elif s["index"] in side:
+            fp_px[f"past {side[s['index']]}"] += fp
+    inter, pred, true = (sum(s[k] for s in slices) for k in ("inter", "pred", "true"))
+    fp_px["total"] = pred - inter  # also counts scans with no prostate at all, which none of the groups above do
+    return {"fp_px": fp_px, "fp_share": fp_px["total"] / max(pred, 1),
+            "precision": inter / max(pred, 1), "recall": inter / max(true, 1)}
 
 def pick_failures(slices):
     picks, used = [], set()

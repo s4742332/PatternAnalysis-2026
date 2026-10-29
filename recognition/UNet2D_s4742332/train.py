@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from dataset import full_load_dataset, DATA_ROOT, CACHE_DIR, N_LABELS
+from dataset import full_load_dataset, slice_name, DATA_ROOT, CACHE_DIR, N_LABELS
 from modules import UNet2D
 
 LABELS = {"background": 0, "body": 1, "femoral hip":2, "bladder":3, "rectum":4, "prostate":5}
@@ -42,6 +42,8 @@ def parse_args():
                    help="ce_dice adds a soft Dice term on the foreground classes so small structures like the apex count")
     p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
                    help="cosine decays the lr from --lr to 0 over --epochs")
+    p.add_argument("--oversample-ends", type=float, default=None, metavar="FACTOR",
+                   help="draw base and apex prostate slices FACTOR times as often as the rest, epochs stay the same length")
     return p.parse_args()
 
 def set_seed(seed: int):
@@ -55,18 +57,20 @@ def setup(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
     loaders = full_load_dataset(seed=args.seed, batch_size=args.batch_size, augment=args.augment,
                                 num_workers=args.num_workers, n_val=args.n_val, n_test=args.n_test,
-                                root=DATA_ROOT, cache_dir=CACHE_DIR, patient_weighting=args.patient_weighting)
+                                root=DATA_ROOT, cache_dir=CACHE_DIR, patient_weighting=args.patient_weighting,
+                                slice_weights=(lambda ds: end_weights(ds, args.oversample_ends)) if args.oversample_ends else None)
 
     model = UNet2D(1, N_LABELS, conv_depths=tuple(args.conv_depths), skip_connected=args.skip_connected).to(device)
     loss_fn = CEDiceLoss() if args.loss == "ce_dice" else nn.CrossEntropyLoss()
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     run_name = f"{'skip' if args.skip_connected else 'noskip'}_pw-{args.patient_weighting}_seed{args.seed}"
-    # only non-default settings go in the name, so the older runs keep theirs
     if args.loss != "ce":
         run_name += f"_{args.loss}"
     if args.lr_schedule != "none":
         run_name += f"_{args.lr_schedule}"
+    if args.oversample_ends:
+        run_name += f"_ends{args.oversample_ends:g}"
     run_dir = args.out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -76,8 +80,6 @@ def setup(args):
     return device, loaders, model, loss_fn, optimiser, run_dir
 
 class CEDiceLoss(nn.Module):
-    """cross entropy + (1 - mean soft Dice over the foreground classes).
-    Dice is summed over the whole batch, so a class missing from one slice doesn't blow up"""
     def __init__(self, n_classes=N_LABELS, smooth=1.0):
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
@@ -85,7 +87,7 @@ class CEDiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits, mask):
-        probs = logits.softmax(dim=1)[:, 1:]  # background left out, it would dominate the mean
+        probs = logits.softmax(dim=1)[:, 1:] 
         target = nn.functional.one_hot(mask, self.n_classes).permute(0, 3, 1, 2)[:, 1:].float()
         inter = (probs * target).sum(dim=(0, 2, 3))
         total = probs.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3))
@@ -121,6 +123,12 @@ def prostate_regions(dataset):
         for rank, s in enumerate(prostate):
             regions[f"case_{patient:03d}_week_{week}_slice_{s}"] = 3 * rank // len(prostate)
     return regions
+
+def end_weights(dataset, factor):
+    """sampling weight per slice: factor for base and apex prostate slices, 1 for the rest"""
+    regions = prostate_regions(dataset)
+    ends = (REGIONS.index("base"), REGIONS.index("apex"))
+    return torch.tensor([factor if regions.get(slice_name(sid), -1) in ends else 1.0 for sid in dataset.ids], dtype=torch.double)
 
 def run_epoch(model, loader, loss_fn, device, optimiser=None, regions=None):
     training = optimiser is not None
