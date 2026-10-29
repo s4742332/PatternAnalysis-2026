@@ -5,7 +5,11 @@
 
 ### Problem
 
+In prostate radiotherapy planning, imaging specalist must be able to correctly classify and delinate between the prostate, the femoral hip, the bladder, the rectum, and the body and background to plan the path of an external-beam. This a high precision, high context task to delinate target volumes with milimeter level precision. In the case of under-countering the prostate region, tumours have a chance to regrow and reoccur in the patient. In the case of over-countouring, suurounding organs can become irratiated due to the radiation, causing high levels of patient pain and potential radiation toxicity. Both scenarios ultimately lead to reduced patient health outcomes. As such tools that can assist in this planning process are desired.
+
 ### 2D U-Net Architecture
+
+
 
 ## Solution
 
