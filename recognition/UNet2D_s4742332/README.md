@@ -23,12 +23,12 @@ A conda environmented was used for this application with the following dependenc
 The following versions of dependencies are required:
 
 ```
-Python:
-torch:
-torchvision:
-nibabel:
-numpy:
-matplotlib:
+Python:      3.12.15
+torch:       2.14.1+cu126  (CUDA 12.6)
+torchvision: 0.29.1+cu126
+nibabel:     5.4.2
+numpy:       2.5.2
+matplotlib:  3.11.2
 ```
 
 ### Reproducibility
@@ -43,8 +43,10 @@ This was primarily made ro run on a GTX 1660 Ti GPU, with secondary consideratio
 
 The following commands were used to run the train.py and predict.py using command line argparse. All runs are save under skip/noskip, weighted sampling procedure, seed, and any additional CLI's used such as original split, CE for CE Dice Loss added and so on and so forth.
 
-```
+```Shell
+cd \path\to\PatternAnalysis-2026\recognition\UNet2D_s4742332
 
+# train: no-skip, lightweight depths, no patient weighting, original split
 ```
 
 ## Investigation
@@ -57,11 +59,18 @@ Each image loaded is center cropped to 256x128. This is the standard majority fo
 
 ### Baseline Implementation and Comparison
 
-The baseline comparison for this project, unlike the Ronneberger paper's which used a sliding window CNN as a comparison, was a no skip U-NET architecture. This was employed to investigate in particular the effects provide precise localisation. In this problem, where spatial localisation is significant to patient health outcomes, .
+The baseline comparison for this project, unlike the Ronneberger paper's which used a sliding window CNN as a comparison, was a no skip U-NET architecture. This was employed to investigate in particular the effects provided by the skip connections in regards to precise localisation. This study aims to see whether the information conncection between encoder and decoder actually help in prostate boundary deliniation, in particular at difficult zones such as the apex and the base where the glands are smallest and hardest to segment. As a result, in a problem where spatial localisation is significant to patient health outcomes, this study investigates  how much of the base and apex DICE results rely on skip connections to be more accurately localised.
 
-A basic 2D U-Net architecture was initially employed to be compared against and then a later developed 2.5D model was developed to see if any limitations of identified in the failure autopsy could be overcome.
+The comparative model was a basic 2D U-Net architecture. 
 
-- A no skip UNET vs a Skip connected U Net was investgated for this as a baseline to investgate the effects
+The setup up was as follows:
+
+| Model         | Params | Depths             | Epochs |
+| ------------- | ------ | ------------------ | ------ |
+| No-skip U-Net | 6.98M  | 32 64 128 256 512  | 20     |
+| Skip U-Net    | 7.77M  | 32 64 128 256 512  | 20     |
+
+Skip connections widen the decoder's input channels, as such the models are not the same size.
 
 ### Quantative Benchmarking
 
@@ -83,13 +92,19 @@ Patients with unique anatomy cases such as patient 010 should be considered to b
 
 ## Limitations
 
-- significant overlap of the prostate with the bladder in ground truth masks often lead to cautious under countered predictions of prostate
+The following limitations have been identified:
 
-## Artifical Intelligence Usage Disclosure
+- significant overlap of the prostate with the bladder in ground truth masks often lead to cautious under countered predictions of prostate
+- small test set with only 3 patients with 9 scans in total, with none having full weeks of treatment
+- model-size the no-skip model and the skip model had different parameter sizes, so this comparison isn't parameter matched
+- normalisation per slice z-scoring alters the intensity scales at the base and apex slices. Per voume normalisation was untried, but has the potential for raising base and apex slice DICE scores.
+- 2D slices do not have the same contextual information as 2.5D and 3D which could lead to greater outcomes.
+
+## Artificial Intelligence Usage Disclosure
 
 The following AI tool was utilized in this projet: Claude Code
 
-The following tasks were where AI was utilized: Cleaning up print statements to ensure good terminal experiences, creating plotting scripts that assist in visualisation,
+The following tasks were where AI was utilized: Cleaning up print statements to ensure good terminal experiences, creating plotting scripts that assist in visualisation, validation of methodology and approach to scaffolding and alteration of existing code to suit project purposes
 
 AI-suggested code was auditied with:
 
