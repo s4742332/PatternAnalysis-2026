@@ -1,5 +1,9 @@
 # HipMRI Prostate Segmentation for Radiotherapy Planning using 2D U-Net CNN Architecture
 
+Authour: Samantha Krause
+
+SID: 47423323
+
 ## Introduction
 
 ### Problem
