@@ -46,7 +46,13 @@ The following commands were used to run the train.py and predict.py using comman
 ```Shell
 cd \path\to\PatternAnalysis-2026\recognition\UNet2D_s4742332
 
-# train: no-skip, lightweight depths, no patient weighting, original split
+# train: no-skip and skip, lightweight depths, no patient weighting, original split
+python train.py --no-skip --conv-depths 32 64 128 256 512 --epochs 20 --seed 11 --original-split
+python train.py --conv-depths 32 64 128 256 512 --epochs 20 --seed 11 --original-split
+
+# evaluate: validation first, then test once
+python predict.py runs\noskip_pw-None_seed11_origsplit runs\skip_pw-None_seed11_origsplit --split validate
+python predict.py runs\noskip_pw-None_seed11_origsplit runs\skip_pw-None_seed11_origsplit --split test
 ```
 
 ## Investigation
@@ -61,22 +67,59 @@ Each image loaded is center cropped to 256x128. This is the standard majority fo
 
 The baseline comparison for this project, unlike the Ronneberger paper's which used a sliding window CNN as a comparison, was a no skip U-NET architecture. This was employed to investigate in particular the effects provided by the skip connections in regards to precise localisation. This study aims to see whether the information conncection between encoder and decoder actually help in prostate boundary deliniation, in particular at difficult zones such as the apex and the base where the glands are smallest and hardest to segment. As a result, in a problem where spatial localisation is significant to patient health outcomes, this study investigates  how much of the base and apex DICE results rely on skip connections to be more accurately localised.
 
-The comparative model was a basic 2D U-Net architecture. 
+The comparative model was a basic 2D U-Net architecture.
 
 The setup up was as follows:
 
-| Model         | Params | Depths             | Epochs |
-| ------------- | ------ | ------------------ | ------ |
-| No-skip U-Net | 6.98M  | 32 64 128 256 512  | 20     |
-| Skip U-Net    | 7.77M  | 32 64 128 256 512  | 20     |
+| Model         | Params | Depths            | Epochs |
+| ------------- | ------ | ----------------- | ------ |
+| No-skip U-Net | 6.98M  | 32 64 128 256 512 | 20     |
+| Skip U-Net    | 7.77M  | 32 64 128 256 512 | 20     |
 
-Skip connections widen the decoder's input channels, as such the models are not the same size.
+Skip connections widen the decoder's input channels, as such the models are not the same size. Lightweight deths were chosen over the default parameters to ensure that it was more suitable to low end ordinary consumer hardware as the tool is aimed at radiology specalists who may not have access to this hardware. One augumentation seed was chosen and the original split was uesd,
 
 ### Quantative Benchmarking
 
-The primary benchmarking parameters for these models include per-class DICE score, per-patient DICE Score for prostate DICE in particuar, interference of  test, and a base central an apex DICE. Peak VRAM
+The primary benchmarking parameters for these models include:
 
-### Example Inputs and Outputs
+1. Per-class DICE score to evaluate how well the model is able to identify each class and organ and is the standard overlap measure for segmentation. Background class is in each slice, so high DICE scores for this class is to be expected. This allows for decent quick look evaluation at model performance.
+2. Per-location of base central and apex DICE enables the DICE to be disectted to ensure that the domination of large central slices do not hide end failures of the gland. This shows if there is any weak points in the model
+3. Per-patient DICE Score for prostate DICE in particular as this organ is the primary target with over or under countouring to. As such mean +- std and min are applied to these scores to understand performance of each contour plan. As such good averages do not hide unusable datasets and scans.
+4. Inference ms/slice and peak VRAM were meaured to ensure that the tool can integrate into existing workflows on more commonly available hardware.
+
+### Example Outputs
+
+The following is outputted into the folder during training underneath curves.png and shows the training and validation loss, the validation DICE score and the validation DICE score for the prostate by region over each epoch. history.json contains the historical information that produces these graphic visualisations.
+
+![1793325847435](image/README/1793325847435.png)
+
+The following table shows the first 10 epoch history for both models on seed 11 for augmentation.
+
+| Model/Epoch | 1     | 2     | 3     | 4     | 5     | 6     | 7     | 8     | 9     | 10    |
+| ----------- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- |
+| No skip     | 0.551 | 0.799 | 0.831 | 0.753 | 0.825 | 0.811 | 0.842 | 0.847 | 0.842 | 0.831 |
+| Skip        | 0.783 | 0.796 | 0.722 | 0.814 | 0.826 | 0.825 | 0.796 | 0.844 | 0.836 | 0.843 |
+
+The following table compares the best checkpoint of each model (seed 11, original split) on the validation and test sets.
+
+|                                 | No-skip val                     | Skip val                                  | No-skip test                    | Skip test                                 |
+| ------------------------------- | ------------------------------- | ----------------------------------------- | ------------------------------- | ----------------------------------------- |
+| Params                          | 6.98M                           | 7.77M                                     | 6.98M                           | 7.77M                                     |
+| Best epoch                      | 19                              | 15                                        | 19                              | 15                                        |
+| Prostate Dice                   | 0.848                           | **0.856**                           | 0.862                           | **0.871**                           |
+| Prostate IoU                    | 0.736                           | 0.748                                     | 0.757                           | 0.772                                     |
+| Base / central / apex Dice      | **0.835** / 0.897 / 0.783 | 0.828 / **0.907** / **0.794** | 0.839 / 0.909 / 0.803           | 0.839 / **0.920** / **0.807** |
+| Per-case Dice (min)             | 0.839 ± 0.067 (0.665)          | 0.848 ± 0.079 (0.620)                    | 0.857 ± 0.027 (0.814)          | **0.875 ± 0.018 (0.851)**          |
+| Precision / recall              | 0.870 / 0.827                   | 0.883 / 0.831                             | 0.878 / 0.846                   | 0.873 / **0.870**                   |
+| Slices missed entirely          | 19                              | **16**                              | 23                              | **15**                              |
+| Beyond-gland slices             | 12                              | **9**                               | 8                               | **0**                               |
+| Stray-blob slices               | **2**                     | 7                                         | **0**                     | 2                                         |
+| Bladder Dice                    | 0.855                           | **0.887**                           | 0.961                           | 0.966                                     |
+| Inference (batch 16), peak VRAM | **3.0 ms/slice, 0.56 GB** | 3.5 ms/slice, 0.63 GB                     | **3.0 ms/slice, 0.56 GB** | 3.4 ms/slice, 0.63 GB                     |
+
+### In Regards to Baseline vs Comparative Models
+
+The skip connections gave small gains on this task, smaller than expected. As more seeds were not tested, these results may not be fully indicative how the extent to which skip connections assit with spatial localisation of the prostate base, central and apex slices.
 
 ### Failure Case Autopsy & Usability Analysis
 
@@ -88,7 +131,13 @@ The following were identified as failure cases within this study:
 4. Over prediction of an area split by region and past the apex and base by using a pixel total of prediction - intersection.
 5. Failure to predict the base, central, apex slices of the prostate with a DICE score of less than 0.75. This is under-prediction accuracy in an area of the prostate.
 
-Patients with unique anatomy cases such as patient 010 should be considered to be done primarily by hand with minimal assistance from this tool as it was unable to identify this patient's results.
+It is recommended that this tool be used as a first-draft with human review for each slice. At 0.2s per scan, and 0.63GB peak VRAM usage it runs well on consumer GPUs that are more available to be used. This means that it will fit easily into a specialists workflow with minimal time loss. However, whilst it can primarily be trusted with central regions of the prostate it heavily struggles with the apex, and a majority of slices are missed at this point.
+
+Patients with unique anatomy cases such as patient 010, 038. 041 should be considered to be done primarily by hand with minimal assistance from this tool as it was unable to identify this patient's results. The model tends to struggle with more unique orientations of anatomy, in particular of the rectum, and then tends to be overly cautious when this occurs. An example of failures from the skip run is shown below.
+
+![1793326536814](image/README/1793326536814.png)
+
+The recommended configuration is the 2D skip U-Net with the listed depth as earlier but to come at the cost of indepth and accuracy to ensure performance on lower end GPUs available to the end users.
 
 ## Limitations
 
@@ -104,17 +153,27 @@ The following limitations have been identified:
 
 The following AI tool was utilized in this projet: Claude Code
 
-The following tasks were where AI was utilized: Cleaning up print statements to ensure good terminal experiences, creating plotting scripts that assist in visualisation, validation of methodology and approach to scaffolding and alteration of existing code to suit project purposes
+The following tasks were where AI was utilized: Cleaning up print statements to ensure good terminal experiences, creating plotting scripts that assist in visualisation, validation of methodology and approach to scaffolding and alteration of existing code to suit project purposes, soundboard prompting to encourage further indepth thinking about the dataset, referencing in the report, assistance with data compliation into Tables for the README.md
 
-AI-suggested code was auditied with:
+AI-suggested code was auditied with: Manual Reading, AI generated code was kept seperated from the submission through the chat, Tests and consistent running of the code to ensure that no hallucinations had occured, diff was used to ensure that the AI had only touched what it was prompted to, runtime checks onthe code to ensure that errors were captured early, manual audits of the files and code, visual checks, and rejecting suggestions based on evidence or findings through testing.
 
 ## References
 
 The following references were used in writing the report:
 
+[1] School of Electrical Engineering and Computer Science, "COMP3710 Pattern Recognition and Analysis: Report specification," v2.5, The University of Queensland, 2026.
+
+[2] T. T. T. Nguyen, H. Arimura, R. Asamura, T. Hirose, S. Ohga, and J. Fukunaga, "Comparison of volumetric-modulated arc therapy and intensity-modulated radiation therapy prostate cancer plans accounting for cold spots," *Radiological Physics and Technology*, vol. 12, no. 2, pp. 137–148, 2019, doi: [10.1007/s12194-019-00502-0](https://doi.org/10.1007/s12194-019-00502-0).
+
+[3] O. Ronneberger, "U-Net: Convolutional networks for biomedical image segmentation," Department of Computer Science, University of Freiburg. [Online]. Available: [https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/](https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/)
+
+[4] O. Ronneberger, P. Fischer, and T. Brox, "U-Net: Convolutional networks for biomedical image segmentation," in *Medical Image Computing and Computer-Assisted Intervention – MICCAI 2015*, Lecture Notes in Computer Science, vol. 9351, Cham: Springer, 2015, pp. 234–241. [Online]. Available: [https://arxiv.org/abs/1505.04597](https://arxiv.org/abs/1505.04597)
+
+[5] A. Chornyi, "2D and 3D U-Net architectures," Codefinity, Nov. 2024. [Online]. Available: [https://codefinity.com/blog/2D-and-3D-U-Net-Architectures](https://codefinity.com/blog/2D-and-3D-U-Net-Architectures)
+
 The following references were used in writing the code:
 
-pytorch-Unet, Danka Tivadar, Steinbach Peter, [github.com/cosmic-cortex/pytorch-UNet/tree/master](https://github.com/cosmic-cortex/pytorch-UNet/tree/master)
+[6] T. Danka and P. Steinbach, "pytorch-UNet," GitHub repository. [Online]. Available: [https://github.com/cosmic-cortex/pytorch-UNet](https://github.com/cosmic-cortex/pytorch-UNet)
 
 # Required Feasibility
 
