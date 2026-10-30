@@ -1,4 +1,3 @@
-
 # HipMRI Prostate Segmentation for Radiotherapy Planning using 2D U-Net CNN Architecture
 
 ## Introduction
@@ -13,9 +12,11 @@ In prostate radiotherapy planning, imaging specalist must be able to correctly c
 
 *Image: U-Net Architecture courtsey of [Dept. of Computer Science Univerisity of Freiburg](https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/)*
 
-The U-Net CNN architecture was initally created by Ronneberger for the ISBI challegne fro segmentation of neuronal structures in electron microscopic stacks, a biomedical segmentation problems and thus makes it an ideal solution to the presented problem. The base architecture of a U-Net CNN consists of a symmetry encoder and decoder with skip connections connecting the layers between each. 
+The U-Net CNN architecture was initally created by Ronneberger for the ISBI challegne fro segmentation of neuronal structures in electron microscopic stacks, a biomedical segmentation problems and thus makes it an ideal solution to the presented problem. The base architecture of a U-Net CNN consists of a symmetry encoder and decoder with skip connections connecting the layers between each. The encoder downsamples an image's information to extract key details about each segment, and the decoder upsamples to regain the resolution it lost with the skip connections inbetween each layer reintroducing lost spatial infomation.
 
 ## Solution
+
+A conda environmented was used for this application with the following dependencies and packages:
 
 ### Dependencies
 
@@ -30,18 +31,75 @@ numpy:
 matplotlib:
 ```
 
-
 ### Reproducibility
+
+The 2D .nii.gz dataset is labelled HipMRISlices and can be accessed in UQ's rangpur system.
+
+Seeds 11,
+
+This was primarily made ro run on a GTX 1660 Ti GPU, with secondary considerations to A100 GPU's available on UQ's Rangpur. Training was fp32 and AMP was turned off the duration of training to ensure no NaNs were produced on the card.
+
+### Commands
+
+The following commands were used to run the train.py and predict.py using command line argparse. All runs are save under skip/noskip, weighted sampling procedure, seed, and any additional CLI's used such as original split, CE for CE Dice Loss added and so on and so forth.
+
+```
+
+```
+
+## Investigation
 
 ### Data and Preprocessing
 
+The HipMRISlices dataset was presplit into training, testing, and validations with raw and prior hand classified images by a radiology specialist. Reseeding and resplitting the patients is also done to confirm that the effects are not limited to a lucky seeding batch. This split is at the patient-level, with each patient having between 1-8 weeks worth of scans, with 60 slices per scan. Patient-level splitting is required as the anatomy, and thus the differences in segmentation and classification scenarios. is the primary source of variance between images. Leakage between training, validation, and testing of patients slices, weeks, or  doubling of the patients is then considered a worst case scenario as a single patient can be over-fitted or over-represented in the dataset. Validation check points within dataset.py is used then to ensure that this scenario does not occur.
+
+Each image loaded is center cropped to 256x128. This is the standard majority format that the .nii.gz files are in except for one outlier within week 00 of patient 00 which is 256x144. Cropping is required to ensure that the models all have the same input length. Per-slice-z-score normalisation is then applied as MRI intensities have no absolute scale. As a patients anatomy changes over the course of treatment, the raw values week to week also change, and z-scoring removes these offset and scale differences created by time. However, it must be acknowledge that base and apex scan slices contain significantly less prostate class. This means that the approximately zero mean and unit-only  variance that is seen in central slices differ to those in the base or apex scans. It is hypothesised that with --context or 2.5D U-Net that includes neighbour slice normalisation seperately wil be able to overcome the result of z-score normalisation per slice that is required in the preprocessing of this particular dataset.
+
+### Baseline Implementation and Comparison
+
+The baseline comparison for this project, unlike the Ronneberger paper's which used a sliding window CNN as a comparison, was a no skip U-NET architecture. This was employed to investigate in particular the effects provide precise localisation. In this problem, where spatial localisation is significant to patient health outcomes, .
+
+A basic 2D U-Net architecture was initially employed to be compared against and then a later developed 2.5D model was developed to see if any limitations of identified in the failure autopsy could be overcome.
+
+- A no skip UNET vs a Skip connected U Net was investgated for this as a baseline to investgate the effects
+
+### Quantative Benchmarking
+
+The primary benchmarking parameters for these models include per-class DICE score, per-patient DICE Score for prostate DICE in particuar, interference of  test, and a base central an apex DICE. Peak VRAM
+
 ### Example Inputs and Outputs
 
-## Research Dilemma
+### Failure Case Autopsy & Usability Analysis
+
+The following were identified as failure cases within this study:
+
+1. Stray blobs of identified segmented away from the ground truth mask where the true area of the classified segment lies. This includes identifying prostate on an image without prostate identified in the ground truth mask. The threshold for this was $\leq$ 10 px as the end user requires high precision, any stray blobs pose significant threat to patient outcomes.
+2. No prediction of a prostate prediciton when the ground truth mask identified prostate within the image. This is identified through true's pixel mask being larger than 0px and the prediction having 0 pixels. This is also a signifcant concern for missing areas may result in tumour reoccurance.
+3. Beyond the gland or over-zealous predictions in which the ground truth did not identify any prostate. This is categorised when any pixel is present with a prostate classification. Over-zealous predictions over state the region and can pose threat to body tissue within that area if radiotherapy is applied.
+4. Over prediction of an area split by region and past the apex and base by using a pixel total of prediction - intersection.
+5. Failure to predict the base, central, apex slices of the prostate with a DICE score of less than 0.75. This is under-prediction accuracy in an area of the prostate.
+
+Patients with unique anatomy cases such as patient 010 should be considered to be done primarily by hand with minimal assistance from this tool as it was unable to identify this patient's results.
 
 ## Limitations
 
-## Artifical Intelligence Disclourse
+- significant overlap of the prostate with the bladder in ground truth masks often lead to cautious under countered predictions of prostate
+
+## Artifical Intelligence Usage Disclosure
+
+The following AI tool was utilized in this projet: Claude Code
+
+The following tasks were where AI was utilized: Cleaning up print statements to ensure good terminal experiences, creating plotting scripts that assist in visualisation,
+
+AI-suggested code was auditied with:
+
+## References
+
+The following references were used in writing the report:
+
+The following references were used in writing the code:
+
+pytorch-Unet, Danka Tivadar, Steinbach Peter, [github.com/cosmic-cortex/pytorch-UNet/tree/master](https://github.com/cosmic-cortex/pytorch-UNet/tree/master)
 
 # Required Feasibility
 
@@ -64,7 +122,7 @@ The end users are imaging specialists, they require specific, defined and clear 
 - U-NET beats baseline model on prostate DICE under identical conditions
 - Report DICE must be seperate for the first, central, and last slice per scan
 - Report must be able to label per-class DICE for all 6 labels
-- Must be able to be trained on a 6GB GTX 1660 Ti at fp32 with an inference of under 50 ms per slice
+- Must be able to be trained on an A100 GPU on Rangpur with an inference of under 50 ms per slice  or on an6GB GTX 1660 Ti at fp32 240 ms per epoch
 
 ### Model Choice and Concepts
 
@@ -188,5 +246,5 @@ Risk include but are not limited to:
 - If memory runs out:
   - halve batch size or base channel count
 - if time allocation runs out prior to completion:
-  - increase training time
+  - increase training time on rangpur
   - reduce epochs
